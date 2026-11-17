@@ -1,0 +1,40 @@
+# Archived legacy themes (local only)
+_archived_themes/
+
+# Node & Vite build artifacts
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+*.local
+
+# Python & SQLite runtime state
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+attachments_cache/
+**/attachments_cache/
+
+# Secrets & environment files
+.env
+.env.*
+*.pem
+*.key
+.initial_admin_credentials
+**/.initial_admin_credentials
+
+# OS & editor files
+.DS_Store
+Thumbs.db
+*.log
+.idea/
+.vscode/
