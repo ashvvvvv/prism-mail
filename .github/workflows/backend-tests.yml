@@ -13,6 +13,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Build SPA frontends required by route tests
+        run: |
+          for ui in frontend-v2 frontend-apple frontend-editorial; do
+            npm install --prefix "$ui" --no-audit --no-fund
+            npm run build --prefix "$ui"
+          done
       - name: Install backend and test dependencies
         run: |
           python -m pip install --upgrade pip
