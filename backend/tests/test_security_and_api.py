@@ -695,6 +695,8 @@ def test_external_domain_isolation_multi_ip_fallback_and_pdf_csp():
         srv.close()
 
     # 4. Inline PDF CSP allows object-src 'self' without sandbox, and invalid folder update returns 400
+    # Create the mailbox explicitly: this test must not depend on later test order.
+    _ensure_policy_and_external_fixtures(client)
     with database.SessionLocal() as db:
         mb = db.query(database.Mailbox).filter(database.Mailbox.address == "bot@policytest.org").first()
         msg = EmailMessage()
