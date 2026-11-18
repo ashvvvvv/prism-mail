@@ -2,6 +2,7 @@
 import { ref, computed } from 'vue'
 import { useMailStore } from '../stores/mail'
 import PrismWordmark from './PrismWordmark.vue'
+import SafeMailHtml from './SafeMailHtml.vue'
 import {
   Reply, ZoomIn, ZoomOut, Star, Trash2, FileText,
   Download, Copy, Check, KeyRound, Sun, Moon, ArrowLeft, Loader2
@@ -259,12 +260,12 @@ defineExpose({
 
           <!-- Mail Body -->
           <div
-            class="transition-transform origin-top"
+            class="transition-transform origin-top-left"
             :style="{ transform: `scale(${zoom})` }"
           >
-            <div
+            <SafeMailHtml
               v-if="store.selectedMailDetail.body_html"
-              v-html="store.selectedMailDetail.body_html"
+              :html="store.selectedMailDetail.body_html"
               :class="[
                 'text-[14px] leading-relaxed',
                 htmlPaperMode || store.theme === 'porcelain' ? 'pm-mail-paper' : 'pm-mail-adaptive'

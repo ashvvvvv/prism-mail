@@ -119,7 +119,12 @@ const quickCommands = computed(() => [
     label: '退出登录',
     hint: '',
     icon: LogOut,
-    run: () => { window.location.href = '/logout' }
+    run: async () => {
+      try {
+        await fetch('/api/auth/logout', { method: 'POST' })
+      } catch {}
+      window.location.href = '/login'
+    }
   }
 ])
 

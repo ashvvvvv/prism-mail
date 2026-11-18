@@ -40,9 +40,12 @@ const copyValue = async (key, text) => {
 }
 
 const handleCreateDomain = async () => {
-  if (domainName.value.trim()) {
-    await store.createDomain(domainName.value.trim(), domainDesc.value.trim())
-    closeAdd()
+  const cleaned = domainName.value.trim().replace(/^@/, '')
+  if (cleaned) {
+    try {
+      await store.createDomain(cleaned, domainDesc.value.trim())
+      closeAdd()
+    } catch {}
   }
 }
 
@@ -54,8 +57,10 @@ const handleDeleteDomain = async (domain) => {
     danger: true
   })
   if (ok) {
-    await store.deleteDomain(domain.id)
-    closeDns()
+    try {
+      await store.deleteDomain(domain.id)
+      closeDns()
+    } catch {}
   }
 }
 </script>

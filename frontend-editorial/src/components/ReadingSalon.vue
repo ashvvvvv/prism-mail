@@ -2,6 +2,7 @@
 import { ref, computed } from 'vue'
 import { useMailStore, extractVerificationCode } from '../stores/mail'
 import PrismWordmark from './PrismWordmark.vue'
+import SafeMailHtml from './SafeMailHtml.vue'
 import {
   Reply, ZoomIn, ZoomOut, Star, Trash2, FileText,
   Download, Copy, Check, Stamp, Sun, Moon, ArrowLeft, Loader2
@@ -313,12 +314,12 @@ defineExpose({
 
           <!-- Crisp Stationery Reader Body -->
           <div
-            class="transition-transform origin-top pt-1"
+            class="transition-transform origin-top-left pt-1"
             :style="{ transform: `scale(${zoom})` }"
           >
-            <div
+            <SafeMailHtml
               v-if="store.selectedMailDetail.body_html"
-              v-html="store.selectedMailDetail.body_html"
+              :html="store.selectedMailDetail.body_html"
               :class="[
                 'text-[14.5px] leading-[1.8]',
                 htmlStationeryPaper || store.theme === 'paper' ? 'ed-mail-paper' : 'ed-mail-adaptive'

@@ -2,16 +2,10 @@
 <html lang="zh-CN" data-theme="cupertino-light">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
+    <link rel="icon" type="image/svg+xml" href="%BASE_URL%favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title>PrismMail</title>
-    <script>
-      (function () {
-        var m = localStorage.getItem('prism_color_mode') || 'system';
-        var dark = m === 'dark' || (m !== 'light' && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
-        document.documentElement.setAttribute('data-theme', dark ? 'cupertino-dark' : 'cupertino-light');
-      })();
-    </script>
+    <script src="%BASE_URL%theme-init.js"></script>
   </head>
   <body class="antialiased overflow-hidden select-none">
     <div id="app"></div>

@@ -47,6 +47,14 @@ const formatSenderOption = (mb) => {
   return hasNote ? `${mb.address} (${mb.name})` : mb.address
 }
 
+const escapeHtml = (str) =>
+  String(str || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+
 const handleSend = async () => {
   if (!recipient.value.trim() || !subject.value.trim() || !selectedMailboxId.value || isSending.value) return
   isSending.value = true
@@ -55,7 +63,7 @@ const handleSend = async () => {
       mailbox_id: selectedMailboxId.value,
       recipient: recipient.value.trim(),
       subject: subject.value.trim(),
-      body_html: `<div>${bodyText.value.replace(/\n/g, '<br/>')}</div>`,
+      body_html: `<div>${escapeHtml(bodyText.value).replace(/\n/g, '<br/>')}</div>`,
       body_text: bodyText.value
     })
     recipient.value = ''

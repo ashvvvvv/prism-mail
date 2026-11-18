@@ -363,7 +363,7 @@
         try {
           await fetch('/api/settings/ui', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'PrismMail' },
             body: JSON.stringify({ ui_edition: edition })
           });
         } catch {}

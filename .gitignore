@@ -29,8 +29,14 @@ attachments_cache/
 .env.*
 *.pem
 *.key
+.master_key
+**/.master_key
 .initial_admin_credentials
 **/.initial_admin_credentials
+
+# Test caches
+.pytest_cache/
+**/.pytest_cache/
 
 # OS & editor files
 .DS_Store

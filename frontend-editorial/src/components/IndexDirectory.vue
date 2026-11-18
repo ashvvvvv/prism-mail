@@ -90,8 +90,10 @@ const handleSyncExternal = async (mb) => {
   syncingMailboxIds.value.add(mb.id)
   try {
     const res = await store.syncExternalMailbox(mb.id)
-    if (res.status === 'error') {
-      store.notify(`同步异常: ${res.error || '请检查授权密码'}`, 'error')
+    const syncStatus = String(res?.sync_status || '')
+    if (res?.status === 'error' || syncStatus.startsWith('error')) {
+      const reason = res?.detail || res?.error || syncStatus.replace(/^error:\s*/i, '') || '请检查授权密码'
+      store.notify(`同步异常: ${reason}`, 'error')
     } else {
       store.notify(`${mb.address} 已同步`, 'success')
     }
@@ -162,8 +164,10 @@ const submitAddMailbox = async () => {
   const pfx = newMailboxPrefix.value.trim()
   if (!pfx || !newMailboxDomain.value) return
   const note = newMailboxNote.value.trim() || pfx
-  await store.createMailbox(newMailboxDomain.value.id, pfx, note)
-  newMailboxDomain.value = null
+  try {
+    await store.createMailbox(newMailboxDomain.value.id, pfx, note)
+    newMailboxDomain.value = null
+  } catch {}
 }
 
 const openNewLabelModal = (fromEditModal = false) => {
@@ -175,11 +179,13 @@ const openNewLabelModal = (fromEditModal = false) => {
 const submitCreateLabel = async () => {
   const name = newLabelName.value.trim()
   if (!name) return
-  const created = await store.createMailboxLabel(name, '')
-  if (assignNewLabelToEdit.value && created?.id && editingMailbox.value) {
-    editForm.value.label_ids.push(created.id)
-  }
-  showNewLabelModal.value = false
+  try {
+    const created = await store.createMailboxLabel(name, '')
+    if (assignNewLabelToEdit.value && created?.id && editingMailbox.value) {
+      editForm.value.label_ids.push(created.id)
+    }
+    showNewLabelModal.value = false
+  } catch {}
 }
 
 const handleDeleteLabel = async (grp) => {
@@ -190,7 +196,9 @@ const handleDeleteLabel = async (grp) => {
     danger: true
   })
   if (ok) {
-    await store.deleteMailboxLabel(grp.label_id)
+    try {
+      await store.deleteMailboxLabel(grp.label_id)
+    } catch {}
   }
 }
 
@@ -202,7 +210,9 @@ const handleDeleteMailbox = async (mb) => {
     danger: true
   })
   if (ok) {
-    await store.deleteMailbox(mb.id)
+    try {
+      await store.deleteMailbox(mb.id)
+    } catch {}
   }
 }
 
@@ -343,9 +353,11 @@ const executeDropAction = async (mode) => {
       labelIds.push(targetGroup.label_id)
     }
   }
-  await store.updateMailboxMetadata(mailbox.id, { label_ids: labelIds })
-  store.notify(`已更新 ${mailbox.address} 所属分组`, 'success')
-  pendingDropAction.value = null
+  try {
+    await store.updateMailboxMetadata(mailbox.id, { label_ids: labelIds })
+    store.notify(`已更新 ${mailbox.address} 所属分组`, 'success')
+    pendingDropAction.value = null
+  } catch {}
 }
 
 const openMailboxSettings = (mb) => {
@@ -368,12 +380,14 @@ const toggleEditLabel = (labelId) => {
 
 const saveMailboxSettings = async () => {
   if (editingMailbox.value) {
-    await store.updateMailboxMetadata(editingMailbox.value.id, {
-      label_ids: editForm.value.label_ids,
-      is_vip: editForm.value.is_vip
-    })
-    store.notify('邮箱设置已保存', 'success')
-    editingMailbox.value = null
+    try {
+      await store.updateMailboxMetadata(editingMailbox.value.id, {
+        label_ids: editForm.value.label_ids,
+        is_vip: editForm.value.is_vip
+      })
+      store.notify('邮箱设置已保存', 'success')
+      editingMailbox.value = null
+    } catch {}
   }
 }
 </script>

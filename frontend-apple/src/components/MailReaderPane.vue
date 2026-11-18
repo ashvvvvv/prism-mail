@@ -1,6 +1,7 @@
 <script setup>
 import { ref, computed } from 'vue'
 import { useMailStore } from '../stores/mail'
+import SafeMailHtml from './SafeMailHtml.vue'
 import {
   Reply,
   ZoomIn,
@@ -283,12 +284,12 @@ defineExpose({
 
           <!-- Mail Body Content -->
           <div
-            class="transition-transform origin-top"
+            class="transition-transform origin-top-left"
             :style="{ transform: `scale(${zoom})` }"
           >
-            <div
+            <SafeMailHtml
               v-if="store.selectedMailDetail.body_html"
-              v-html="store.selectedMailDetail.body_html"
+              :html="store.selectedMailDetail.body_html"
               :class="[
                 'text-[14px] leading-[1.68]',
                 htmlPaperMode || store.theme === 'cupertino-light'

@@ -1,15 +1,88 @@
+import base64
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
-from sqlalchemy import create_engine, Column, Integer, String, Text, Boolean, DateTime, ForeignKey, text
+import secrets
+from cryptography.fernet import Fernet
+from sqlalchemy import create_engine, Column, Integer, String, Text, Boolean, DateTime, ForeignKey, text, event
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATABASE_URL = f"sqlite:///{os.path.join(BASE_DIR, 'seek_mail.db')}"
+DATA_DIR = os.environ.get("PRISM_DATA_DIR", BASE_DIR)
+os.makedirs(DATA_DIR, exist_ok=True)
+DATABASE_URL = os.environ.get("PRISM_DATABASE_URL") or f"sqlite:///{os.path.join(DATA_DIR, 'seek_mail.db')}"
 
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SECRET_PREFIX = "enc:v1:"
+
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {})
+
+
+@event.listens_for(engine, "connect")
+def _set_sqlite_pragma(dbapi_connection, connection_record):
+    if engine.dialect.name == "sqlite":
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL;")
+        cursor.execute("PRAGMA busy_timeout=5000;")
+        cursor.execute("PRAGMA foreign_keys=ON;")
+        cursor.close()
+
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+
+
+def _get_master_key_material() -> str:
+    env_key = os.environ.get("PRISM_MASTER_KEY", "").strip()
+    if env_key:
+        return env_key
+    key_path = os.path.join(DATA_DIR, ".master_key")
+    if os.path.isfile(key_path):
+        with open(key_path, "r", encoding="utf-8") as f:
+            existing = f.read().strip()
+        if existing:
+            return existing
+    raw_key = secrets.token_urlsafe(32)
+    try:
+        fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(raw_key)
+        try:
+            os.chmod(key_path, 0o600)
+        except Exception:
+            pass
+        return raw_key
+    except FileExistsError:
+        with open(key_path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+
+
+def _get_fernet() -> Fernet:
+    derived = base64.urlsafe_b64encode(
+        hashlib.sha256(_get_master_key_material().encode("utf-8")).digest()
+    )
+    return Fernet(derived)
+
+
+def encrypt_secret(plain: str) -> str:
+    if not plain:
+        return ""
+    if plain.startswith(SECRET_PREFIX):
+        return plain
+    token = _get_fernet().encrypt(plain.encode("utf-8")).decode("ascii")
+    return f"{SECRET_PREFIX}{token}"
+
+
+def decrypt_secret(stored: str) -> str:
+    if not stored:
+        return ""
+    if not stored.startswith(SECRET_PREFIX):
+        return stored
+    token = stored[len(SECRET_PREFIX):]
+    try:
+        return _get_fernet().decrypt(token.encode("ascii")).decode("utf-8")
+    except Exception:
+        return ""
 
 class User(Base):
     """个人自用主账号"""
@@ -123,7 +196,7 @@ class Mailbox(Base):
     imap_port = Column(Integer, default=993)
     smtp_host = Column(String(150), default="")
     smtp_port = Column(Integer, default=465)
-    auth_password = Column(String(255), default="")
+    auth_password = Column(Text, default="")
     sync_status = Column(String(100), default="ok")
     last_synced_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
@@ -132,6 +205,12 @@ class Mailbox(Base):
     group = relationship("MailboxGroup", back_populates="mailboxes")
     labels = relationship("MailboxLabel", secondary="mailbox_label_mappings", back_populates="mailboxes")
     mails = relationship("Mail", back_populates="mailbox", cascade="all, delete-orphan")
+
+    def set_auth_password(self, plain: str) -> None:
+        self.auth_password = encrypt_secret(plain or "")
+
+    def get_auth_password(self) -> str:
+        return decrypt_secret(self.auth_password or "")
 
 class Mail(Base):
     """邮件数据表"""
@@ -200,6 +279,13 @@ class Tag(Base):
 
 def init_db():
     Base.metadata.create_all(bind=engine)
+    if DATABASE_URL.startswith("sqlite:///"):
+        db_file = DATABASE_URL[len("sqlite:///"):]
+        if db_file and os.path.isfile(db_file):
+            try:
+                os.chmod(db_file, 0o600)
+            except Exception:
+                pass
     # Safe auto-migration for existing SQLite database
     with engine.connect() as conn:
         for col_stmt in [
@@ -257,6 +343,24 @@ def init_db():
                         "INSERT INTO mailbox_label_mappings (mailbox_id, label_id, created_at) "
                         "VALUES (:mb_id, :lbl_id, datetime('now'))"
                     ), {"mb_id": mb_id, "lbl_id": grp_id})
+                conn.commit()
+        except Exception:
+            pass
+
+        # Encrypt legacy plaintext external mailbox passwords in place
+        try:
+            rows = conn.execute(
+                text("SELECT id, auth_password FROM mailboxes WHERE auth_password IS NOT NULL AND auth_password != ''")
+            ).fetchall()
+            migrated = False
+            for mb_id, raw_pwd in rows:
+                if raw_pwd and not str(raw_pwd).startswith(SECRET_PREFIX):
+                    conn.execute(
+                        text("UPDATE mailboxes SET auth_password = :enc WHERE id = :id"),
+                        {"enc": encrypt_secret(str(raw_pwd)), "id": mb_id},
+                    )
+                    migrated = True
+            if migrated:
                 conn.commit()
         except Exception:
             pass

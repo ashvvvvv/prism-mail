@@ -5,7 +5,7 @@ PrismMail 专为外部 AI Agent Harness（如 **Hermes**、MCP Server、自动�
 - **服务地址示例**：`https://mail.example.com`（本地调用：`http://127.0.0.1:8000`）
 - **交互式 OpenAPI 文档**：`https://mail.example.com/docs`
 - **自描述接口规范**：`GET /api/agent/spec`
-- **全站强制鉴权**：所有 `/api/*` 与 `/api/agent/*` 接口均需携带请求头 `Authorization: Bearer <API_KEY>`（或 `X-API-Key: <API_KEY>`），密钥可在登录后前往 `/account` 查看或重置。
+- **全站强制鉴权**：自动化接口采用最小权限隔离，`Authorization: Bearer <API_KEY>`（或 `X-API-Key: <API_KEY>`）专用于访问 `/api/agent/*` 以及外部邮箱绑定/同步接口（`POST /api/external-mailboxes`、`POST /api/external-mailboxes/{mailbox_id}/sync`），管理面板接口要求管理员 Web 会话鉴权；密钥可在登录后前往 `/account` 查看或重置。
 
 ---
 

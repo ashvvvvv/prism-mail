@@ -2,18 +2,23 @@ import base64
 import email
 from email import policy
 from email.message import EmailMessage
-from email.utils import parsedate_to_datetime, parseaddr
+from email.utils import parsedate_to_datetime, parseaddr, getaddresses
 import hashlib
 import html
+from html.parser import HTMLParser
 import imaplib
 import io
+import ipaddress
 import json
 import mimetypes
 import os
 import re
 import shutil
 import smtplib
+import socket
+import ssl
 import subprocess
+import tempfile
 import threading
 import time
 from urllib.parse import quote
@@ -22,7 +27,7 @@ if "ID" not in imaplib.Commands:
     imaplib.Commands["ID"] = ("NONAUTH", "AUTH", "SELECTED")
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
-from fastapi import FastAPI, Depends, HTTPException, Query
+from fastapi import FastAPI, Depends, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, RedirectResponse, Response
@@ -31,16 +36,23 @@ from sqlalchemy.orm import Session
 from sqlalchemy import or_
 
 from database import (
-    SessionLocal, init_db, User, Domain, Mailbox,
+    DATA_DIR, SessionLocal, init_db, User, Domain, Mailbox,
     MailboxGroup, MailboxLabel, MailboxLabelMapping, Mail, Tag
 )
-from auth_portal import register_auth_middleware_and_routes, get_active_ui_prefs
+from auth_portal import register_auth_middleware_and_routes, get_active_ui_prefs, get_agent_policy
 
-VMAIL_DIR = "/var/vmail"
-POSTFIX_VMAILBOX = "/etc/postfix/vmailbox"
-DOVECOT_USERS = "/etc/dovecot/users"
-ATTACHMENT_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "attachments_cache")
+VMAIL_DIR = os.environ.get("PRISM_VMAIL_DIR", "/var/vmail")
+POSTFIX_VMAILBOX = os.environ.get("PRISM_POSTFIX_VMAILBOX", "/etc/postfix/vmailbox")
+DOVECOT_USERS = os.environ.get("PRISM_DOVECOT_USERS", "/etc/dovecot/users")
+ATTACHMENT_CACHE_DIR = os.environ.get(
+    "PRISM_ATTACHMENT_CACHE_DIR",
+    os.path.join(DATA_DIR, "attachments_cache"),
+)
 os.makedirs(ATTACHMENT_CACHE_DIR, exist_ok=True)
+try:
+    os.chmod(ATTACHMENT_CACHE_DIR, 0o700)
+except Exception:
+    pass
 
 init_db()
 
@@ -50,9 +62,11 @@ app = FastAPI(
     version="3.1.0"
 )
 
+register_auth_middleware_and_routes(app)
+
 _cors_origins = [
     o.strip()
-    for o in os.environ.get("PRISM_CORS_ORIGINS", "http://127.0.0.1:8000,http://localhost:5173").split(",")
+    for o in os.environ.get("PRISM_CORS_ORIGINS", "").split(",")
     if o.strip()
 ]
 
@@ -64,8 +78,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-register_auth_middleware_and_routes(app)
-
 def get_db():
     db = SessionLocal()
     try:
@@ -74,17 +86,137 @@ def get_db():
         db.close()
 
 # ----------------- CONTENT & METADATA EXTRACTION HELPERS -----------------
+_HTML_SKIP_TAGS = {"script", "style", "head", "title", "svg", "noscript", "template"}
+_HTML_BLOCK_TAGS = {"p", "div", "tr", "li", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "section", "article", "header", "footer", "hr"}
+_HTML_SCOPE_BARRIER_TAGS = {
+    "div", "p", "table", "thead", "tbody", "tfoot", "tr", "td", "th",
+    "section", "article", "aside", "main", "nav", "header", "footer",
+    "blockquote", "ul", "ol", "li", "dl", "dt", "dd", "details", "summary",
+    "figure", "figcaption", "form", "fieldset", "pre",
+    "h1", "h2", "h3", "h4", "h5", "h6",
+}
+_HTML_VOID_TAGS = {"br", "hr", "img", "input", "meta", "link", "area", "base", "col", "embed", "param", "source", "track", "wbr"}
+_CSS_HEX_ESCAPE_RE = re.compile(r"\\([0-9a-fA-F]{1,6})(?:\r\n|[ \t\r\n\f])?")
+_CSS_CHAR_ESCAPE_RE = re.compile(r"\\([^\r\n\f0-9a-fA-F])")
+_HIDDEN_STYLE_RE = re.compile(
+    r"(?:"
+    r"display\s*:\s*none\b"
+    r"|visibility\s*:\s*(?:hidden|collapse)\b"
+    r"|opacity\s*:\s*(?:0+(?:\.0+)?|\.0+)%?(?![0-9.])"
+    r"|font-size\s*:\s*(?:0+(?:\.0+)?|\.0+)(?:px|pt|em|rem|%|vw|vh|vmin|vmax|ch|ex)?(?![0-9.a-zA-Z])"
+    r"|max-height\s*:\s*(?:0+(?:\.0+)?|\.0+)(?:px|pt|em|rem|%|vh)?(?![0-9.a-zA-Z])"
+    r"|clip-path\s*:\s*inset\(\s*100%"
+    r"|clip\s*:\s*rect\(\s*0(?:px)?\s*,\s*0(?:px)?\s*,\s*0(?:px)?\s*,\s*0(?:px)?\s*\)"
+    r"|transform\s*:\s*scale\(\s*0(?:\.0+)?\s*\)"
+    r"|color\s*:\s*transparent\b"
+    r")",
+    re.IGNORECASE,
+)
+_ZERO_HEIGHT_RE = re.compile(
+    r"(?:^|;)\s*height\s*:\s*(?:0+(?:\.0+)?|\.0+)(?:px|pt|em|rem|%|vh)?(?![0-9.a-zA-Z])",
+    re.IGNORECASE,
+)
+_OVERFLOW_HIDDEN_RE = re.compile(r"overflow(?:-y)?\s*:\s*hidden\b", re.IGNORECASE)
+_MAX_ENDTAG_SCAN = 32
+
+
+def _normalize_css_style(raw_style: str) -> str:
+    if not raw_style:
+        return ""
+    s = re.sub(r"/\*.*?\*/", "", raw_style, flags=re.DOTALL)
+
+    def _hex_repl(m: re.Match) -> str:
+        cp = int(m.group(1), 16)
+        if cp == 0 or cp > 0x10FFFF or (0xD800 <= cp <= 0xDFFF):
+            return "\uFFFD"
+        return chr(cp)
+
+    s = _CSS_HEX_ESCAPE_RE.sub(_hex_repl, s)
+    s = _CSS_CHAR_ESCAPE_RE.sub(r"\1", s)
+    return re.sub(r"/\*.*?\*/", "", s, flags=re.DOTALL)
+
+
+def _is_hidden_element(attrs: List[tuple]) -> bool:
+    for k, v in attrs:
+        key = (k or "").lower()
+        val = (v or "").strip()
+        if key == "hidden":
+            return True
+        if key == "aria-hidden" and val.lower() == "true":
+            return True
+        if key == "style":
+            clean_style = _normalize_css_style(val)
+            if _HIDDEN_STYLE_RE.search(clean_style):
+                return True
+            if _ZERO_HEIGHT_RE.search(clean_style) and _OVERFLOW_HIDDEN_RE.search(clean_style):
+                return True
+    return False
+
+
+class _SafeMailTextExtractor(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: List[str] = []
+        self._tag_stack: List[tuple[str, bool]] = []
+        self._skip_depth: int = 0
+
+    def handle_starttag(self, tag: str, attrs: List[tuple]) -> None:
+        t = (tag or "").lower()
+        if t == "br":
+            if self._skip_depth == 0:
+                self.parts.append("\n")
+            return
+        if t in _HTML_VOID_TAGS:
+            return
+        should_skip = (t in _HTML_SKIP_TAGS) or _is_hidden_element(attrs)
+        self._tag_stack.append((t, should_skip))
+        if should_skip:
+            self._skip_depth += 1
+        elif t in _HTML_BLOCK_TAGS and self._skip_depth == 0:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        t = (tag or "").lower()
+        if t in _HTML_VOID_TAGS or not self._tag_stack:
+            return
+        min_idx = max(0, len(self._tag_stack) - _MAX_ENDTAG_SCAN)
+        is_inline_close = (t not in _HTML_SCOPE_BARRIER_TAGS) and (t not in _HTML_SKIP_TAGS)
+        for idx in range(len(self._tag_stack) - 1, min_idx - 1, -1):
+            stack_tag, stack_skipped = self._tag_stack[idx]
+            if stack_tag == t:
+                popped = self._tag_stack[idx:]
+                del self._tag_stack[idx:]
+                for _, was_skipped in popped:
+                    if was_skipped and self._skip_depth > 0:
+                        self._skip_depth -= 1
+                break
+            if stack_tag in _HTML_SKIP_TAGS:
+                break
+            if is_inline_close and stack_tag in _HTML_SCOPE_BARRIER_TAGS:
+                break
+            if stack_skipped and stack_tag in _HTML_SCOPE_BARRIER_TAGS:
+                break
+        if t in _HTML_BLOCK_TAGS and self._skip_depth == 0:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth == 0 and data:
+            self.parts.append(data)
+
+
 def html_to_plain_text(html_content: str) -> str:
-    """Convert raw HTML email body into clean, readable plain text."""
+    """Convert raw HTML email body into clean, readable plain text using O(N) HTML parsing."""
     if not html_content:
         return ""
-    text_val = re.sub(r"(?is)<(script|style|head|title|svg|noscript)[^>]*>.*?</\1>", " ", html_content)
-    text_val = re.sub(r"(?is)<!--.*?-->", " ", text_val)
-    text_val = re.sub(r"(?i)<br\s*/?>", "\n", text_val)
-    text_val = re.sub(r"(?i)</(p|div|tr|li|h[1-6]|blockquote|section|article|header|footer)>", "\n", text_val)
-    text_val = re.sub(r"(?s)<[^>]+>", " ", text_val)
-    text_val = html.unescape(text_val)
-    text_val = text_val.replace("\xa0", " ").replace("\u200b", "").replace("\u200c", "").replace("\zwnj", "")
+    bounded = html_content[:2_000_000] if len(html_content) > 2_000_000 else html_content
+    parser = _SafeMailTextExtractor()
+    try:
+        parser.feed(bounded)
+        parser.close()
+    except Exception:
+        pass
+    text_val = "".join(parser.parts)
+    text_val = text_val.replace("\xa0", " ").replace("\u200b", "").replace("\u200c", "").replace("\u200d", "")
     lines = [re.sub(r"[ \t\r\f\v]+", " ", line).strip() for line in text_val.splitlines()]
     cleaned_lines = [line for line in lines if line]
     return "\n".join(cleaned_lines)
@@ -103,6 +235,17 @@ def format_attachment_size(size_bytes: int) -> str:
     return f"{max(1, round(size_bytes / 1024))} KB"
 
 
+def _sanitize_attachment_filename(raw_name: Optional[str], idx: int) -> str:
+    cleaned = re.sub(r"[\x00-\x1f\x7f]+", "_", str(raw_name or "").strip())
+    cleaned = cleaned.replace("\\", "/")
+    if len(cleaned) >= 2 and cleaned[1] == ":" and cleaned[0].isalpha():
+        cleaned = cleaned[2:]
+    base = os.path.basename(cleaned).strip()
+    if not base or base in (".", ".."):
+        return f"attachment_{idx}"
+    return base
+
+
 def iter_mime_attachments(msg) -> List[Dict[str, Any]]:
     """Walk an EmailMessage and return ordered attachment dicts including raw bytes."""
     found: List[Dict[str, Any]] = []
@@ -118,7 +261,7 @@ def iter_mime_attachments(msg) -> List[Dict[str, Any]]:
                 try:
                     raw_bytes = part.get_payload(decode=True) or b""
                     idx = len(found)
-                    safe_name = os.path.basename(str(raw_filename or "").strip()) or f"attachment_{idx}"
+                    safe_name = _sanitize_attachment_filename(raw_filename, idx)
                     ctype = part.get_content_type() or mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
                     if ctype == "application/octet-stream":
                         guessed = mimetypes.guess_type(safe_name)[0]
@@ -167,10 +310,15 @@ def enrich_mail_attachments(mail_id: int, raw_list: Optional[List[Dict[str, Any]
     return enriched
 
 
+MAX_PDF_EXTRACT_BYTES = 20 * 1024 * 1024
+
+
 def extract_attachment_text_preview(raw_bytes: bytes, content_type: str, filename: str, max_chars: int = 12000) -> Optional[str]:
     """Extract clean plain text from text/csv/json/html/xml or PDF attachments for AI Agents."""
     if not raw_bytes:
         return ""
+    if len(raw_bytes) > MAX_PDF_EXTRACT_BYTES:
+        return None
     low_name = (filename or "").lower()
     low_ct = (content_type or "").lower()
 
@@ -275,12 +423,13 @@ def extract_mime_bodies_and_attachments(msg) -> tuple[str, str, List[Dict[str, A
 
 def extract_verification_codes(subject: str, body_text: str) -> List[str]:
     """Extract likely OTP / verification codes from subject and plain text body."""
-    combined = f"{subject or ''}\n{body_text or ''}"
+    combined = f"{(subject or '')[:2000]}\n{(body_text or '')[:200_000]}"
     has_keyword = bool(re.search(
         r"(验证码|验证代码|登录代码|安全码|动态码|确认码|code|otp|verification|passcode|pin|token)",
         combined, re.IGNORECASE
     ))
     codes: List[str] = []
+    seen: set[str] = set()
 
     # 1. Contextual match near verification keywords
     ctx_patterns = [
@@ -290,8 +439,11 @@ def extract_verification_codes(subject: str, body_text: str) -> List[str]:
     for pat in ctx_patterns:
         for m in re.finditer(pat, combined, re.IGNORECASE):
             c = m.group(1).strip()
-            if c and c not in codes and not re.match(r"^20[2-3][0-9]$", c):
+            if c and c not in seen and not re.match(r"^20[2-3][0-9]$", c):
+                seen.add(c)
                 codes.append(c)
+                if len(codes) >= 5:
+                    return codes
 
     # 2. Standalone 6-digit or 4-8 digit codes if email has verification keywords
     if has_keyword:
@@ -300,18 +452,23 @@ def extract_verification_codes(subject: str, body_text: str) -> List[str]:
             # Exclude years like 2024..2029
             if re.match(r"^(19\d\d|20[0-3]\d)$", c):
                 continue
-            if c not in codes:
+            if c not in seen:
+                seen.add(c)
                 codes.append(c)
+                if len(codes) >= 5:
+                    return codes
 
     return codes[:5]
 
 def extract_links(body_text: str, body_html: str) -> List[str]:
     """Extract actionable URLs from email content."""
     urls: List[str] = []
+    seen: set[str] = set()
     ignore_ext = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".css", ".woff", ".woff2", ".ico")
     ignore_hosts = ("www.w3.org", "schemas.microsoft.com", "fonts.googleapis.com", "fonts.gstatic.com")
 
-    for src in (body_html or "", body_text or ""):
+    for raw_src in (body_html or "", body_text or ""):
+        src = raw_src[:500_000] if len(raw_src) > 500_000 else raw_src
         for m in re.finditer(r"https?://[^\s\"'<>)\]]+", src, re.IGNORECASE):
             u = html.unescape(m.group(0).rstrip(".,;:!?)>\"'"))
             low = u.lower()
@@ -319,8 +476,11 @@ def extract_links(body_text: str, body_html: str) -> List[str]:
                 continue
             if any(h in low for h in ignore_hosts):
                 continue
-            if u not in urls:
+            if u not in seen:
+                seen.add(u)
                 urls.append(u)
+                if len(urls) >= 20:
+                    return urls
     return urls[:20]
 
 def format_utc_iso(dt: Optional[datetime]) -> str:
@@ -339,104 +499,204 @@ def normalize_to_utc_naive(dt: Optional[datetime]) -> datetime:
     return dt
 
 # ----------------- POSTFIX & DOVECOT SYSTEM PROVISIONING -----------------
+DOMAIN_RE = re.compile(r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,63}|xn--[a-z0-9-]{2,59})$")
+MAILBOX_PREFIX_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._+-]{0,62}[a-z0-9])?$")
+_provisioning_lock = threading.RLock()
+
+
+def validate_domain_name(raw: str) -> str:
+    name = (raw or "").strip().lower()
+    if not name or not DOMAIN_RE.match(name):
+        raise HTTPException(status_code=400, detail="请输入有效的域名")
+    return name
+
+
+def validate_mailbox_prefix(raw: str) -> str:
+    pfx = (raw or "").strip().lower()
+    if not pfx or ".." in pfx or not MAILBOX_PREFIX_RE.match(pfx):
+        raise HTTPException(status_code=400, detail="邮箱前缀格式无效，仅允许字母、数字及 . _ + -")
+    return pfx
+
+
+def _safe_vmail_path(*parts: str) -> str:
+    vmail_root = os.path.realpath(VMAIL_DIR)
+    norm_root = os.path.normcase(vmail_root)
+    target = os.path.realpath(os.path.join(vmail_root, *parts))
+    norm_target = os.path.normcase(target)
+    if norm_target == norm_root or os.path.commonpath([norm_root, norm_target]) != norm_root:
+        raise ValueError(f"Path escapes VMAIL_DIR: {target}")
+    return target
+
+
+def _atomic_write_text(path: str, content: str, mode: int = 0o644) -> None:
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=parent, prefix=".tmp_prism_")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        try:
+            os.chmod(tmp_path, mode)
+        except Exception:
+            pass
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        raise
+
+
+def _write_private_bytes(path: str, data: bytes) -> None:
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    try:
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
+
+
+def _safe_chown_vmail(path: str) -> None:
+    if os.name != "nt" and shutil.which("chown"):
+        subprocess.run(["chown", "-R", "vmail:vmail", path], check=False)
+
+
+def _upgrade_legacy_dovecot_passwords() -> None:
+    if not os.path.isfile(DOVECOT_USERS):
+        return
+    try:
+        with _provisioning_lock:
+            with open(DOVECOT_USERS, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            if ":{PLAIN}PrismMail2026:" in content:
+                updated = content.replace(":{PLAIN}PrismMail2026:", ":!:")
+                _atomic_write_text(DOVECOT_USERS, updated, mode=0o640)
+    except Exception as e:
+        print(f"upgrade_legacy_dovecot_passwords notice: {e}")
+
+
 def ensure_system_domain(domain_name: str):
     """Ensure domain directory exists in /var/vmail and domain is registered in Postfix virtual_mailbox_domains."""
     domain_name = domain_name.strip().lower()
-    if not domain_name or not os.path.exists(VMAIL_DIR):
+    if not domain_name or not DOMAIN_RE.match(domain_name) or not os.path.exists(VMAIL_DIR):
         return
     try:
-        domain_dir = os.path.join(VMAIL_DIR, domain_name)
-        os.makedirs(domain_dir, exist_ok=True)
-        subprocess.run(["chown", "-R", "vmail:vmail", domain_dir], check=False)
+        with _provisioning_lock:
+            domain_dir = _safe_vmail_path(domain_name)
+            os.makedirs(domain_dir, exist_ok=True)
+            _safe_chown_vmail(domain_dir)
 
-        out = subprocess.check_output(["postconf", "-h", "virtual_mailbox_domains"], text=True).strip()
-        domains = [d.strip() for d in re.split(r"[\s,]+", out) if d.strip()]
-        if domain_name not in domains:
-            domains.append(domain_name)
-            new_val = ", ".join(domains)
-            subprocess.run(["postconf", "-e", f"virtual_mailbox_domains = {new_val}"], check=False)
-            subprocess.run(["postfix", "reload"], check=False)
+            if shutil.which("postconf"):
+                out = subprocess.check_output(["postconf", "-h", "virtual_mailbox_domains"], text=True).strip()
+                domains = [d.strip() for d in re.split(r"[\s,]+", out) if d.strip()]
+                if domain_name not in domains:
+                    domains.append(domain_name)
+                    new_val = ", ".join(domains)
+                    subprocess.run(["postconf", "-e", f"virtual_mailbox_domains = {new_val}"], check=False)
+                    if shutil.which("postfix"):
+                        subprocess.run(["postfix", "reload"], check=False)
     except Exception as e:
         print(f"ensure_system_domain notice ({domain_name}): {e}")
+
 
 def provision_system_mailbox(domain_name: str, prefix: str):
     """Ensure Maildir, /etc/postfix/vmailbox, and /etc/dovecot/users have this mailbox configured."""
     domain_name = domain_name.strip().lower()
     prefix = prefix.strip().lower()
+    if (
+        not DOMAIN_RE.match(domain_name)
+        or ".." in prefix
+        or not MAILBOX_PREFIX_RE.match(prefix)
+    ):
+        return
     full_address = f"{prefix}@{domain_name}"
     if not os.path.exists(VMAIL_DIR):
         return
 
     try:
-        ensure_system_domain(domain_name)
-        target_maildir = os.path.join(VMAIL_DIR, domain_name, prefix, "Maildir")
-        for sub in ("cur", "new", "tmp"):
-            os.makedirs(os.path.join(target_maildir, sub), exist_ok=True)
-        subprocess.run(["chown", "-R", "vmail:vmail", os.path.join(VMAIL_DIR, domain_name, prefix)], check=False)
+        with _provisioning_lock:
+            ensure_system_domain(domain_name)
+            mb_root = _safe_vmail_path(domain_name, prefix)
+            target_maildir = _safe_vmail_path(domain_name, prefix, "Maildir")
+            for sub in ("cur", "new", "tmp"):
+                os.makedirs(os.path.join(target_maildir, sub), exist_ok=True)
+            _safe_chown_vmail(mb_root)
 
-        # 1. Ensure /etc/postfix/vmailbox entry
-        if os.path.exists(POSTFIX_VMAILBOX):
-            with open(POSTFIX_VMAILBOX, "r", encoding="utf-8", errors="ignore") as f:
-                vmb_content = f.read()
-            pattern = rf"(?m)^{re.escape(full_address)}\s+"
-            if not re.search(pattern, vmb_content):
-                with open(POSTFIX_VMAILBOX, "a", encoding="utf-8") as f:
-                    if vmb_content and not vmb_content.endswith("\n"):
-                        f.write("\n")
-                    f.write(f"{full_address} {domain_name}/{prefix}/Maildir/\n")
-                subprocess.run(["postmap", POSTFIX_VMAILBOX], check=False)
-                subprocess.run(["postfix", "reload"], check=False)
+            # 1. Ensure /etc/postfix/vmailbox entry
+            if os.path.exists(POSTFIX_VMAILBOX):
+                with open(POSTFIX_VMAILBOX, "r", encoding="utf-8", errors="ignore") as f:
+                    vmb_content = f.read()
+                pattern = rf"(?m)^{re.escape(full_address)}\s+"
+                if not re.search(pattern, vmb_content):
+                    sep = "\n" if (vmb_content and not vmb_content.endswith("\n")) else ""
+                    new_content = f"{vmb_content}{sep}{full_address} {domain_name}/{prefix}/Maildir/\n"
+                    _atomic_write_text(POSTFIX_VMAILBOX, new_content, mode=0o644)
+                    if shutil.which("postmap"):
+                        subprocess.run(["postmap", POSTFIX_VMAILBOX], check=False)
+                    if shutil.which("postfix"):
+                        subprocess.run(["postfix", "reload"], check=False)
 
-        # 2. Ensure /etc/dovecot/users entry (Critical for Dovecot LMTP delivery!)
-        if os.path.exists(DOVECOT_USERS):
-            with open(DOVECOT_USERS, "r", encoding="utf-8", errors="ignore") as f:
-                dovecot_content = f.read()
-            pattern = rf"(?m)^{re.escape(full_address)}:"
-            if not re.search(pattern, dovecot_content):
-                user_line = f"{full_address}:{{PLAIN}}PrismMail2026:5000:5000::/var/vmail/{domain_name}/{prefix}::\n"
-                with open(DOVECOT_USERS, "a", encoding="utf-8") as f:
-                    if dovecot_content and not dovecot_content.endswith("\n"):
-                        f.write("\n")
-                    f.write(user_line)
+            # 2. Ensure /etc/dovecot/users entry (Critical for Dovecot LMTP delivery, password login locked)
+            if os.path.exists(DOVECOT_USERS):
+                with open(DOVECOT_USERS, "r", encoding="utf-8", errors="ignore") as f:
+                    dovecot_content = f.read()
+                pattern = rf"(?m)^{re.escape(full_address)}:"
+                if not re.search(pattern, dovecot_content):
+                    sep = "\n" if (dovecot_content and not dovecot_content.endswith("\n")) else ""
+                    vmail_base = VMAIL_DIR.rstrip("/\\")
+                    user_line = f"{full_address}:!:5000:5000::{vmail_base}/{domain_name}/{prefix}::\n"
+                    _atomic_write_text(DOVECOT_USERS, f"{dovecot_content}{sep}{user_line}", mode=0o640)
     except Exception as e:
         print(f"provision_system_mailbox notice ({full_address}): {e}")
+
 
 def deprovision_system_mailbox(domain_name: str, prefix: str):
     """Remove mailbox from Postfix, Dovecot, and archive its Maildir so sync does not resurrect it."""
     domain_name = domain_name.strip().lower()
     prefix = prefix.strip().lower()
+    if (
+        not DOMAIN_RE.match(domain_name)
+        or ".." in prefix
+        or not MAILBOX_PREFIX_RE.match(prefix)
+    ):
+        return
     full_address = f"{prefix}@{domain_name}"
     if not os.path.exists(VMAIL_DIR):
         return
 
     try:
-        # 1. Remove from /etc/postfix/vmailbox
-        if os.path.exists(POSTFIX_VMAILBOX):
-            with open(POSTFIX_VMAILBOX, "r", encoding="utf-8", errors="ignore") as f:
-                lines = f.readlines()
-            new_lines = [ln for ln in lines if not re.match(rf"^{re.escape(full_address)}\s+", ln.strip())]
-            if len(new_lines) != len(lines):
-                with open(POSTFIX_VMAILBOX, "w", encoding="utf-8") as f:
-                    f.writelines(new_lines)
-                subprocess.run(["postmap", POSTFIX_VMAILBOX], check=False)
-                subprocess.run(["postfix", "reload"], check=False)
+        with _provisioning_lock:
+            # 1. Remove from /etc/postfix/vmailbox
+            if os.path.exists(POSTFIX_VMAILBOX):
+                with open(POSTFIX_VMAILBOX, "r", encoding="utf-8", errors="ignore") as f:
+                    lines = f.readlines()
+                new_lines = [ln for ln in lines if not re.match(rf"^{re.escape(full_address)}\s+", ln.strip())]
+                if len(new_lines) != len(lines):
+                    _atomic_write_text(POSTFIX_VMAILBOX, "".join(new_lines), mode=0o644)
+                    if shutil.which("postmap"):
+                        subprocess.run(["postmap", POSTFIX_VMAILBOX], check=False)
+                    if shutil.which("postfix"):
+                        subprocess.run(["postfix", "reload"], check=False)
 
-        # 2. Remove from /etc/dovecot/users
-        if os.path.exists(DOVECOT_USERS):
-            with open(DOVECOT_USERS, "r", encoding="utf-8", errors="ignore") as f:
-                lines = f.readlines()
-            new_lines = [ln for ln in lines if not ln.strip().startswith(f"{full_address}:")]
-            if len(new_lines) != len(lines):
-                with open(DOVECOT_USERS, "w", encoding="utf-8") as f:
-                    f.writelines(new_lines)
+            # 2. Remove from /etc/dovecot/users
+            if os.path.exists(DOVECOT_USERS):
+                with open(DOVECOT_USERS, "r", encoding="utf-8", errors="ignore") as f:
+                    lines = f.readlines()
+                new_lines = [ln for ln in lines if not ln.strip().startswith(f"{full_address}:")]
+                if len(new_lines) != len(lines):
+                    _atomic_write_text(DOVECOT_USERS, "".join(new_lines), mode=0o640)
 
-        # 3. Move Maildir into /var/vmail/.trash so sync_maildir_to_db won't recreate it
-        mb_dir = os.path.join(VMAIL_DIR, domain_name, prefix)
-        if os.path.exists(mb_dir):
-            trash_root = os.path.join(VMAIL_DIR, ".trash")
-            os.makedirs(trash_root, exist_ok=True)
-            dest = os.path.join(trash_root, f"{domain_name}_{prefix}_{int(time.time())}")
-            shutil.move(mb_dir, dest)
+            # 3. Move Maildir into /var/vmail/.trash so sync_maildir_to_db won't recreate it
+            mb_dir = _safe_vmail_path(domain_name, prefix)
+            if os.path.exists(mb_dir):
+                trash_root = _safe_vmail_path(".trash")
+                os.makedirs(trash_root, exist_ok=True)
+                dest = _safe_vmail_path(".trash", f"{domain_name}_{prefix}_{int(time.time())}")
+                shutil.move(mb_dir, dest)
     except Exception as e:
         print(f"deprovision_system_mailbox notice ({full_address}): {e}")
 
@@ -511,14 +771,21 @@ def sync_maildir_to_db(db: Session, force: bool = False):
 
         # 2. Discover domains in /var/vmail
         IGNORE_DIRS = {"sieve", "lost+found", ".trash"}
-        for domain_name in os.listdir(VMAIL_DIR):
-            if domain_name.startswith(".") or domain_name in IGNORE_DIRS or "." not in domain_name:
+        for raw_domain_name in os.listdir(VMAIL_DIR):
+            domain_name = raw_domain_name.strip().lower()
+            if (
+                raw_domain_name.startswith(".")
+                or domain_name in IGNORE_DIRS
+                or not DOMAIN_RE.match(domain_name)
+            ):
                 continue
-            domain_path = os.path.join(VMAIL_DIR, domain_name)
+            domain_path = os.path.join(VMAIL_DIR, raw_domain_name)
             if not os.path.isdir(domain_path):
                 continue
 
             domain = db.query(Domain).filter(Domain.name == domain_name).first()
+            if domain and getattr(domain, "is_external", False):
+                continue
             if not domain:
                 domain = Domain(
                     user_id=user.id,
@@ -533,10 +800,11 @@ def sync_maildir_to_db(db: Session, force: bool = False):
                 db.refresh(domain)
 
             # 3. Discover mailboxes under this domain
-            for prefix in os.listdir(domain_path):
-                if prefix.startswith("."):
+            for raw_prefix in os.listdir(domain_path):
+                prefix = raw_prefix.strip().lower()
+                if raw_prefix.startswith(".") or ".." in prefix or not MAILBOX_PREFIX_RE.match(prefix):
                     continue
-                mb_path = os.path.join(domain_path, prefix)
+                mb_path = os.path.join(domain_path, raw_prefix)
                 if not os.path.isdir(mb_path):
                     continue
 
@@ -618,7 +886,7 @@ def sync_maildir_to_db(db: Session, force: bool = False):
                         if not is_maildir_message_file(filename):
                             continue
                         file_full = os.path.join(sub_dir, filename)
-                        if not os.path.isfile(file_full):
+                        if os.path.islink(file_full) or not os.path.isfile(file_full):
                             continue
 
                         base_key = filename.split(":2,")[0]
@@ -851,6 +1119,124 @@ def resolve_external_provider_config(
         "smtp_port": int(smtp_port or base_cfg["smtp_port"] or 465),
     }
 
+_CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")
+_BENCHMARK_NET = ipaddress.ip_network("198.18.0.0/15")
+
+
+def _is_disallowed_ip(ip_obj) -> bool:
+    if (
+        not ip_obj.is_global
+        or ip_obj.is_loopback
+        or ip_obj.is_private
+        or ip_obj.is_link_local
+        or ip_obj.is_multicast
+        or ip_obj.is_reserved
+        or ip_obj.is_unspecified
+    ):
+        return True
+    if isinstance(ip_obj, ipaddress.IPv4Address):
+        if ip_obj in _CGNAT_NET or ip_obj in _BENCHMARK_NET:
+            return True
+    elif isinstance(ip_obj, ipaddress.IPv6Address):
+        if ip_obj.ipv4_mapped is not None and _is_disallowed_ip(ip_obj.ipv4_mapped):
+            return True
+        if ip_obj.sixtofour is not None and _is_disallowed_ip(ip_obj.sixtofour):
+            return True
+        if ip_obj.teredo is not None:
+            server_ip, client_ip = ip_obj.teredo
+            if _is_disallowed_ip(server_ip) or _is_disallowed_ip(client_ip):
+                return True
+    return False
+
+
+def validate_external_mail_endpoint(host: str, port: int) -> List[str]:
+    """Validate external IMAP/SMTP hostname and port against SSRF/private networks and return safe resolved IPs."""
+    clean_host = (host or "").strip().strip("[]").rstrip(".")
+    if (
+        not clean_host
+        or len(clean_host) > 253
+        or any(ord(c) <= 0x20 or ord(c) >= 0x7F for c in clean_host)
+        or any(bad in clean_host for bad in ("/", "\\", "@", ":", "?", "#"))
+    ):
+        raise HTTPException(status_code=400, detail="邮件服务器主机名格式无效")
+
+    low_host = clean_host.lower()
+    if low_host == "localhost" or low_host.endswith((".localhost", ".local", ".internal", ".arpa")):
+        if os.environ.get("PRISM_ALLOW_PRIVATE_MAIL_HOSTS", "").strip() != "1":
+            raise HTTPException(status_code=400, detail="不允许连接本机或内网保留主机名")
+
+    allowed_ports_raw = os.environ.get("PRISM_ALLOWED_MAIL_PORTS", "143,993,465,587,2525")
+    allowed_ports = {int(p.strip()) for p in allowed_ports_raw.split(",") if p.strip().isdigit()}
+    if int(port) not in allowed_ports:
+        raise HTTPException(status_code=400, detail=f"不支持的邮件服务端口: {port}")
+
+    allow_private = os.environ.get("PRISM_ALLOW_PRIVATE_MAIL_HOSTS", "").strip() == "1"
+    try:
+        addr_infos = socket.getaddrinfo(clean_host, int(port), type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        raise HTTPException(status_code=400, detail=f"无法解析邮件服务器主机名: {clean_host}")
+
+    if not addr_infos:
+        raise HTTPException(status_code=400, detail=f"未解析到可用的服务器地址: {clean_host}")
+
+    validated_ips: List[str] = []
+    for _, _, _, _, sockaddr in addr_infos:
+        ip_str = sockaddr[0]
+        try:
+            ip_obj = ipaddress.ip_address(ip_str)
+        except ValueError:
+            ip_obj = ipaddress.ip_address(ip_str.split("%", 1)[0])
+        if not allow_private and _is_disallowed_ip(ip_obj):
+            raise HTTPException(status_code=400, detail="不允许连接内网、回环或保留地址")
+        if ip_str not in validated_ips:
+            validated_ips.append(ip_str)
+    return validated_ips or [clean_host]
+
+
+def _connect_validated_ips(validated_ips, port: int, timeout: float, source_address=None):
+    ips = [validated_ips] if isinstance(validated_ips, str) else list(validated_ips)
+    last_err: Optional[Exception] = None
+    for ip_str in ips:
+        try:
+            return socket.create_connection((ip_str, int(port)), timeout, source_address)
+        except OSError as err:
+            last_err = err
+    if last_err is not None:
+        raise last_err
+    raise OSError("No validated IP addresses available to connect")
+
+
+class SafeIMAP4_SSL(imaplib.IMAP4_SSL):
+    def __init__(self, host: str, port: int, validated_ips, ssl_context: ssl.SSLContext, timeout: float = 15):
+        self._validated_ips = validated_ips
+        self._sni_host = host
+        super().__init__(host=host, port=port, ssl_context=ssl_context, timeout=timeout)
+
+    def _create_socket(self, timeout):
+        sock = _connect_validated_ips(self._validated_ips, self.port, timeout)
+        return self.ssl_context.wrap_socket(sock, server_hostname=self._sni_host)
+
+
+class SafeSMTP_SSL(smtplib.SMTP_SSL):
+    def __init__(self, host: str, port: int, validated_ips, context: ssl.SSLContext, timeout: float = 20):
+        self._validated_ips = validated_ips
+        self._sni_host = host
+        super().__init__(host=host, port=port, timeout=timeout, context=context)
+
+    def _get_socket(self, host, port, timeout):
+        new_socket = _connect_validated_ips(self._validated_ips, port, timeout, self.source_address)
+        return self.context.wrap_socket(new_socket, server_hostname=self._sni_host)
+
+
+class SafeSMTP(smtplib.SMTP):
+    def __init__(self, host: str, port: int, validated_ips, timeout: float = 20):
+        self._validated_ips = validated_ips
+        super().__init__(host=host, port=port, timeout=timeout)
+
+    def _get_socket(self, host, port, timeout):
+        return _connect_validated_ips(self._validated_ips, port, timeout, self.source_address)
+
+
 def test_external_mailbox_connection(
     address: str,
     password: str,
@@ -866,9 +1252,13 @@ def test_external_mailbox_connection(
     if imap_host in ("imap.gmail.com", "smtp.gmail.com") and len(clean_pwd.replace(" ", "")) == 16:
         clean_pwd = clean_pwd.replace(" ", "")
 
+    imap_ip = validate_external_mail_endpoint(imap_host, int(imap_port))
+    smtp_ip = validate_external_mail_endpoint(smtp_host, int(smtp_port)) if (test_smtp and smtp_host) else ""
+    ssl_ctx = ssl.create_default_context()
+
     inbox_count = 0
     try:
-        imap = imaplib.IMAP4_SSL(imap_host, int(imap_port), timeout=12)
+        imap = SafeIMAP4_SSL(imap_host, int(imap_port), imap_ip, ssl_ctx, timeout=12)
         imap.login(address, clean_pwd)
         try:
             imap._simple_command("ID", '("name" "PrismMail" "version" "3.1" "vendor" "PrismMail")')
@@ -881,27 +1271,31 @@ def test_external_mailbox_connection(
             except Exception:
                 pass
         imap.logout()
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=400,
-            detail=f"IMAP 收信服务器 ({imap_host}:{imap_port}) 认证失败，请检查账号或授权码/应用专用密码是否正确：{e}"
+            detail=f"IMAP 收信服务器 ({imap_host}:{imap_port}) 连接或认证失败 ({type(e).__name__})，请检查主机名、端口及授权码/应用专用密码"
         )
 
     if test_smtp and smtp_host:
         try:
             if int(smtp_port) == 465:
-                with smtplib.SMTP_SSL(smtp_host, int(smtp_port), timeout=12) as s:
+                with SafeSMTP_SSL(smtp_host, int(smtp_port), smtp_ip, ssl_ctx, timeout=12) as s:
                     s.login(address, clean_pwd)
             else:
-                with smtplib.SMTP(smtp_host, int(smtp_port), timeout=12) as s:
+                with SafeSMTP(smtp_host, int(smtp_port), smtp_ip, timeout=12) as s:
                     s.ehlo()
-                    s.starttls()
+                    s.starttls(context=ssl_ctx)
                     s.ehlo()
                     s.login(address, clean_pwd)
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(
                 status_code=400,
-                detail=f"IMAP 连接成功，但 SMTP 发信服务器 ({smtp_host}:{smtp_port}) 认证失败：{e}"
+                detail=f"IMAP 连接成功，但 SMTP 发信服务器 ({smtp_host}:{smtp_port}) 连接或认证失败 ({type(e).__name__})"
             )
 
     return {
@@ -918,13 +1312,16 @@ _last_ext_sync_ts: float = 0.0
 
 def sync_single_external_mailbox(db: Session, mb: Mailbox, max_fetch: int = 40) -> int:
     """Pull latest messages via IMAP for a single external mailbox."""
-    if not mb.is_external or not mb.imap_host or not mb.auth_password:
+    ext_pwd = mb.get_auth_password()
+    if not mb.is_external or not mb.imap_host or not ext_pwd:
         return 0
 
     new_count = 0
     try:
-        imap = imaplib.IMAP4_SSL(mb.imap_host, int(mb.imap_port or 993), timeout=15)
-        imap.login(mb.address, mb.auth_password)
+        imap_ip = validate_external_mail_endpoint(mb.imap_host, int(mb.imap_port or 993))
+        ssl_ctx = ssl.create_default_context()
+        imap = SafeIMAP4_SSL(mb.imap_host, int(mb.imap_port or 993), imap_ip, ssl_ctx, timeout=15)
+        imap.login(mb.address, ext_pwd)
         try:
             imap._simple_command("ID", '("name" "PrismMail" "version" "3.1" "vendor" "PrismMail")')
         except Exception:
@@ -954,7 +1351,9 @@ def sync_single_external_mailbox(db: Session, mb: Mailbox, max_fetch: int = 40) 
 
         missing_uids = []
         for raw_uid in recent_uids:
-            uid_str = raw_uid.decode("utf-8", errors="ignore") if isinstance(raw_uid, bytes) else str(raw_uid)
+            uid_str = (raw_uid.decode("utf-8", errors="ignore") if isinstance(raw_uid, bytes) else str(raw_uid)).strip()
+            if not uid_str.isdigit():
+                continue
             key = f"imap:{mb.id}:{uid_str}"
             if key not in existing_keys:
                 missing_uids.append(uid_str)
@@ -1013,9 +1412,9 @@ def sync_single_external_mailbox(db: Session, mb: Mailbox, max_fetch: int = 40) 
                 cached_eml_path = f"imap://{mb.imap_host}/INBOX/{uid_str}"
                 if attachments and raw_bytes:
                     try:
-                        local_eml = os.path.join(ATTACHMENT_CACHE_DIR, f"imap_{mb.id}_{uid_str}.eml")
-                        with open(local_eml, "wb") as ef:
-                            ef.write(raw_bytes)
+                        safe_uid = re.sub(r"[^A-Za-z0-9._-]", "_", uid_str)
+                        local_eml = os.path.join(ATTACHMENT_CACHE_DIR, f"imap_{mb.id}_{safe_uid}.eml")
+                        _write_private_bytes(local_eml, raw_bytes)
                         cached_eml_path = local_eml
                     except Exception:
                         pass
@@ -1086,7 +1485,8 @@ def _external_imap_daemon_loop():
 
 threading.Thread(target=_external_imap_daemon_loop, daemon=True).start()
 
-# Run initial sync and heal any missing system mailbox entries
+# Run initial sync, upgrade legacy dovecot entries, and heal any missing system mailbox entries
+_upgrade_legacy_dovecot_passwords()
 with SessionLocal() as db_session:
     sync_maildir_to_db(db_session, force=False)
     for mb_item in db_session.query(Mailbox).all():
@@ -1221,12 +1621,36 @@ def list_domains(db: Session = Depends(get_db)):
         })
     return res
 
+def _cleanup_mail_cache_files(mails: List[Mail], mailbox_ids: Optional[List[int]] = None) -> None:
+    cache_root = os.path.normcase(os.path.realpath(ATTACHMENT_CACHE_DIR))
+    for m in mails or []:
+        candidates = [os.path.join(ATTACHMENT_CACHE_DIR, f"mail_{m.id}.eml")]
+        if m.maildir_path and not str(m.maildir_path).startswith("imap://"):
+            resolved = os.path.realpath(m.maildir_path)
+            if os.path.commonpath([cache_root, os.path.normcase(resolved)]) == cache_root:
+                candidates.append(resolved)
+        for p in candidates:
+            try:
+                if os.path.isfile(p):
+                    os.remove(p)
+            except Exception:
+                pass
+    for mb_id in mailbox_ids or []:
+        prefix = f"imap_{mb_id}_"
+        try:
+            for fname in os.listdir(ATTACHMENT_CACHE_DIR):
+                if fname.startswith(prefix) and fname.endswith(".eml"):
+                    fpath = os.path.join(ATTACHMENT_CACHE_DIR, fname)
+                    if os.path.isfile(fpath):
+                        os.remove(fpath)
+        except Exception:
+            pass
+
+
 @app.post("/api/domains")
 def create_domain(payload: DomainCreate, db: Session = Depends(get_db)):
     user = db.query(User).first()
-    name = payload.name.strip().lower()
-    if not name or "." not in name:
-        raise HTTPException(status_code=400, detail="请输入有效的域名")
+    name = validate_domain_name(payload.name)
 
     if db.query(Domain).filter(Domain.name == name).first():
         raise HTTPException(status_code=400, detail="该域名已绑定")
@@ -1259,15 +1683,35 @@ def create_domain(payload: DomainCreate, db: Session = Depends(get_db)):
     # Provision in Postfix & Dovecot
     provision_system_mailbox(name, "admin")
 
-    return {"status": "success", "domain_id": domain.id, "name": domain.name}
+    return {
+        "status": "success",
+        "id": domain.id,
+        "domain_id": domain.id,
+        "name": domain.name,
+        "description": domain.description,
+        "is_verified": domain.is_verified,
+        "is_external": bool(getattr(domain, "is_external", False)),
+        "dns_records": {
+            "mx": domain.mx_record,
+            "spf": domain.spf_record,
+            "dkim_selector": domain.dkim_selector,
+            "dkim_value": domain.dkim_public_key,
+            "dmarc": domain.dmarc_record,
+        },
+        "created_at": format_utc_iso(domain.created_at),
+    }
 
 @app.delete("/api/domains/{domain_id}")
 def delete_domain(domain_id: int, db: Session = Depends(get_db)):
     d = db.query(Domain).filter(Domain.id == domain_id).first()
     if not d:
         raise HTTPException(status_code=404, detail="Domain not found")
+    mb_list = list(d.mailboxes)
+    mb_ids = [mb.id for mb in mb_list]
+    mails_to_clean = db.query(Mail).filter(Mail.mailbox_id.in_(mb_ids)).all() if mb_ids else []
+    _cleanup_mail_cache_files(mails_to_clean, mailbox_ids=mb_ids)
     if not getattr(d, "is_external", False):
-        for mb in list(d.mailboxes):
+        for mb in mb_list:
             if not mb.is_external:
                 deprovision_system_mailbox(d.name, mb.prefix)
     db.delete(d)
@@ -1285,10 +1729,10 @@ def create_mailbox_under_domain(domain_id: int, payload: MailboxCreate, db: Sess
     domain = db.query(Domain).filter(Domain.id == domain_id).first()
     if not domain:
         raise HTTPException(status_code=404, detail="Domain not found")
+    if getattr(domain, "is_external", False):
+        raise HTTPException(status_code=400, detail="外部互联域名不支持直接开通本地邮箱，请通过外部邮箱接入绑定")
 
-    pfx = payload.prefix.strip().lower()
-    if not pfx or "@" in pfx:
-        raise HTTPException(status_code=400, detail="邮箱前缀格式无效")
+    pfx = validate_mailbox_prefix(payload.prefix)
     full_address = f"{pfx}@{domain.name}"
 
     if db.query(Mailbox).filter(Mailbox.address == full_address).first():
@@ -1334,6 +1778,8 @@ def delete_mailbox(mailbox_id: int, db: Session = Depends(get_db)):
     domain_name = domain.name if domain else "example.com"
     pfx = mb.prefix
     is_ext = bool(mb.is_external)
+    mails_to_clean = db.query(Mail).filter(Mail.mailbox_id == mb.id).all()
+    _cleanup_mail_cache_files(mails_to_clean, mailbox_ids=[mb.id])
     db.query(MailboxLabelMapping).filter(MailboxLabelMapping.mailbox_id == mb.id).delete()
     db.delete(mb)
     db.commit()
@@ -1402,14 +1848,26 @@ def api_test_external_mailbox(payload: ExternalMailboxPayload):
     }
 
 @app.post("/api/external-mailboxes")
-def create_or_update_external_mailbox(payload: ExternalMailboxPayload, db: Session = Depends(get_db)):
+def create_or_update_external_mailbox(payload: ExternalMailboxPayload, request: Request, db: Session = Depends(get_db)):
     addr = payload.address.strip().lower()
     if "@" not in addr:
         raise HTTPException(status_code=400, detail="请输入完整的邮箱地址（如 example@gmail.com 或 123456@qq.com）")
     if not payload.auth_password or not payload.auth_password.strip():
         raise HTTPException(status_code=400, detail="请输入邮箱授权码或应用专用密码")
 
-    pfx, dom_name = addr.split("@", 1)
+    raw_pfx, raw_dom = addr.split("@", 1)
+    pfx = validate_mailbox_prefix(raw_pfx)
+    dom_name = validate_domain_name(raw_dom)
+    addr = f"{pfx}@{dom_name}"
+    _check_agent_policy(request, target_address=addr, is_send=True)
+
+    existing_domain = db.query(Domain).filter(Domain.name == dom_name).first()
+    if existing_domain and not getattr(existing_domain, "is_external", False):
+        raise HTTPException(status_code=400, detail="本地自建域名不支持覆盖接入为外部互联邮箱")
+    existing_mb = db.query(Mailbox).filter(Mailbox.address == addr).first()
+    if existing_mb and not getattr(existing_mb, "is_external", False):
+        raise HTTPException(status_code=400, detail="本地系统邮箱不支持原地覆盖为外部互联邮箱")
+
     cfg = resolve_external_provider_config(
         address=addr,
         provider=payload.provider,
@@ -1434,6 +1892,8 @@ def create_or_update_external_mailbox(payload: ExternalMailboxPayload, db: Sessi
 
     user = db.query(User).first()
     domain = db.query(Domain).filter(Domain.name == dom_name).first()
+    if domain and not getattr(domain, "is_external", False):
+        raise HTTPException(status_code=400, detail="本地自建域名不支持覆盖接入为外部互联邮箱")
     if not domain:
         domain = Domain(
             user_id=user.id if user else 1,
@@ -1450,6 +1910,8 @@ def create_or_update_external_mailbox(payload: ExternalMailboxPayload, db: Sessi
 
     mb = db.query(Mailbox).filter(Mailbox.address == addr).first()
     if mb:
+        if not getattr(mb, "is_external", False):
+            raise HTTPException(status_code=400, detail="本地系统邮箱不支持原地覆盖为外部互联邮箱")
         mb.name = (payload.name or "").strip() or mb.name or pfx
         mb.is_external = True
         mb.provider = cfg["provider"]
@@ -1457,7 +1919,7 @@ def create_or_update_external_mailbox(payload: ExternalMailboxPayload, db: Sessi
         mb.imap_port = cfg["imap_port"]
         mb.smtp_host = cfg["smtp_host"]
         mb.smtp_port = cfg["smtp_port"]
-        mb.auth_password = clean_pwd
+        mb.set_auth_password(clean_pwd)
         mb.sync_status = "ok"
         if payload.is_vip is not None:
             mb.is_vip = payload.is_vip
@@ -1479,9 +1941,9 @@ def create_or_update_external_mailbox(payload: ExternalMailboxPayload, db: Sessi
             imap_port=cfg["imap_port"],
             smtp_host=cfg["smtp_host"],
             smtp_port=cfg["smtp_port"],
-            auth_password=clean_pwd,
             sync_status="ok"
         )
+        mb.set_auth_password(clean_pwd)
         db.add(mb)
         db.commit()
         db.refresh(mb)
@@ -1513,19 +1975,25 @@ def create_or_update_external_mailbox(payload: ExternalMailboxPayload, db: Sessi
     }
 
 @app.post("/api/external-mailboxes/{mailbox_id}/sync")
-def manual_sync_external_mailbox(mailbox_id: int, db: Session = Depends(get_db)):
+def manual_sync_external_mailbox(mailbox_id: int, request: Request, db: Session = Depends(get_db)):
     mb = db.query(Mailbox).filter(Mailbox.id == mailbox_id).first()
     if not mb or not mb.is_external:
         raise HTTPException(status_code=404, detail="未找到该外部邮箱")
+    _check_agent_policy(request, target_address=mb.address)
     new_count = sync_single_external_mailbox(db, mb, max_fetch=50)
-    return {
-        "status": "ok",
+    sync_st = str(mb.sync_status or "ok")
+    is_err = sync_st.startswith("error")
+    resp: Dict[str, Any] = {
+        "status": "error" if is_err else "ok",
         "mailbox_id": mb.id,
         "address": mb.address,
         "new_mails": new_count,
-        "sync_status": mb.sync_status,
-        "last_synced_at": format_utc_iso(mb.last_synced_at) if mb.last_synced_at else None
+        "sync_status": sync_st,
+        "last_synced_at": format_utc_iso(mb.last_synced_at) if mb.last_synced_at else None,
     }
+    if is_err:
+        resp["detail"] = sync_st
+    return resp
 
 # ----------------- BUSINESS LABELS & GROUPS CRUD -----------------
 class LabelCreate(BaseModel):
@@ -1979,6 +2447,52 @@ def get_grouped_mailboxes(
                 result_groups.append(bucket)
         return {"mode": selected_mode, "mode_name": "智能职能角色分组", "groups": result_groups}
 
+    elif selected_mode == "status":
+        status_buckets = {
+            "error": {
+                "group_id": "status_error",
+                "name": "⚠️ 同步异常",
+                "description": "外部连接或同步状态异常的邮箱",
+                "group_type": "status",
+                "color": "#ef4444",
+                "icon": "AlertTriangle",
+                "mailboxes": [],
+            },
+            "unread": {
+                "group_id": "status_unread",
+                "name": "🔴 有新未读信件",
+                "description": "当前存在未读收件的活跃邮箱",
+                "group_type": "status",
+                "color": "#f59e0b",
+                "icon": "BellRing",
+                "mailboxes": [],
+            },
+            "normal": {
+                "group_id": "status_normal",
+                "name": "🟢 运行正常",
+                "description": "已同步且收件箱无未读积压的邮箱",
+                "group_type": "status",
+                "color": "#10b981",
+                "icon": "CheckCircle2",
+                "mailboxes": [],
+            },
+        }
+        for m in mailboxes:
+            smb = serialize_mb(m)
+            if str(m.sync_status or "").startswith("error"):
+                status_buckets["error"]["mailboxes"].append(smb)
+            elif unread_map.get(m.id, 0) > 0:
+                status_buckets["unread"]["mailboxes"].append(smb)
+            else:
+                status_buckets["normal"]["mailboxes"].append(smb)
+        result_groups = []
+        for bucket in status_buckets.values():
+            if bucket["mailboxes"]:
+                bucket["total_mailboxes"] = len(bucket["mailboxes"])
+                bucket["unread_count"] = sum(m["unread_count"] for m in bucket["mailboxes"])
+                result_groups.append(bucket)
+        return {"mode": "status", "mode_name": "运行与未读状态分组", "groups": result_groups}
+
     else:
         flat_list = [serialize_mb(m) for m in mailboxes]
         return {
@@ -1999,12 +2513,16 @@ def get_grouped_mailboxes(
         }
 
 # ----------------- FOLDERS & TAGS -----------------
+def _escape_like(val: str) -> str:
+    return (val or "").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 @app.get("/api/folders")
 def list_folders(db: Session = Depends(get_db)):
     base_q = db.query(Mail).filter(Mail.is_deleted == False)
     return [
         {"id": "inbox", "name": "收件箱", "icon": "Inbox", "count": base_q.filter(Mail.folder == "inbox").count()},
-        {"id": "starred", "name": "星标邮件", "icon": "Star", "count": base_q.filter(Mail.is_starred == True).count()},
+        {"id": "starred", "name": "星标邮件", "icon": "Star", "count": base_q.filter(Mail.is_starred == True, Mail.folder != "trash").count()},
         {"id": "sent", "name": "已发送", "icon": "Send", "count": base_q.filter(Mail.folder == "sent").count()},
         {"id": "drafts", "name": "草稿箱", "icon": "FileText", "count": base_q.filter(Mail.folder == "drafts").count()},
         {"id": "trash", "name": "已删除", "icon": "Trash2", "count": base_q.filter(Mail.folder == "trash").count()},
@@ -2049,11 +2567,13 @@ def apply_mail_scope_filters(
         query = query.join(Mailbox).filter(Mailbox.role == role)
 
     if tag:
-        query = query.filter(Mail.tags_json.ilike(f"%{tag}%"))
+        escaped_tag = _escape_like(json.dumps(tag, ensure_ascii=False))
+        query = query.filter(Mail.tags_json.ilike(f"%{escaped_tag}%", escape="\\"))
     return query
 
 @app.get("/api/mails")
 def list_mails(
+    request: Request,
     domain_id: Optional[int] = None,
     mailbox_id: Optional[int] = None,
     label_id: Optional[int] = None,
@@ -2064,11 +2584,16 @@ def list_mails(
     folder: str = "inbox",
     search: Optional[str] = None,
     force_sync: bool = False,
-    limit: int = 50,
-    offset: int = 0,
+    include_body: bool = False,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db)
 ):
-    sync_maildir_to_db(db, force=force_sync)
+    is_csrf_safe_header = request.headers.get("x-requested-with", "").strip().lower() == "prismmail"
+    effective_force_sync = bool(force_sync) and (
+        getattr(request.state, "auth_type", "") != "session" or is_csrf_safe_header
+    )
+    sync_maildir_to_db(db, force=effective_force_sync)
     query = apply_mail_scope_filters(
         db.query(Mail), db,
         domain_id=domain_id, mailbox_id=mailbox_id, label_id=label_id,
@@ -2076,19 +2601,19 @@ def list_mails(
     )
 
     if folder == "starred":
-        query = query.filter(Mail.is_starred == True)
+        query = query.filter(Mail.is_starred == True, Mail.folder != "trash")
     else:
         query = query.filter(Mail.folder == folder)
 
     if search:
-        p = f"%{search}%"
+        p = f"%{_escape_like(search.strip())}%"
         query = query.filter(
             or_(
-                Mail.subject.ilike(p),
-                Mail.sender.ilike(p),
-                Mail.recipient.ilike(p),
-                Mail.preview.ilike(p),
-                Mail.body_text.ilike(p)
+                Mail.subject.ilike(p, escape="\\"),
+                Mail.sender.ilike(p, escape="\\"),
+                Mail.recipient.ilike(p, escape="\\"),
+                Mail.preview.ilike(p, escape="\\"),
+                Mail.body_text.ilike(p, escape="\\")
             )
         )
 
@@ -2097,7 +2622,7 @@ def list_mails(
 
     items = []
     for m in mails:
-        items.append({
+        entry: Dict[str, Any] = {
             "id": m.id,
             "mailbox_id": m.mailbox_id,
             "mailbox_address": m.mailbox.address if m.mailbox else "",
@@ -2106,15 +2631,17 @@ def list_mails(
             "recipient": m.recipient,
             "subject": m.subject,
             "preview": m.preview,
-            "body_html": m.body_html,
-            "body_text": m.body_text,
             "has_attachments": m.has_attachments,
             "attachments": enrich_mail_attachments(m.id, m.attachments),
             "is_read": m.is_read,
             "is_starred": m.is_starred,
             "tags": m.tags,
             "created_at": format_utc_iso(m.created_at)
-        })
+        }
+        if include_body:
+            entry["body_html"] = m.body_html
+            entry["body_text"] = m.body_text
+        items.append(entry)
 
     return {"total": total, "items": items}
 
@@ -2137,7 +2664,7 @@ def get_mail_counts(
     return {
         "inbox": q.filter(Mail.folder == "inbox").count(),
         "inbox_unread": q.filter(Mail.folder == "inbox", Mail.is_read == False).count(),
-        "starred": q.filter(Mail.is_starred == True).count(),
+        "starred": q.filter(Mail.is_starred == True, Mail.folder != "trash").count(),
         "sent": q.filter(Mail.folder == "sent").count(),
         "drafts": q.filter(Mail.folder == "drafts").count(),
         "trash": q.filter(Mail.folder == "trash").count(),
@@ -2146,6 +2673,7 @@ def get_mail_counts(
 @app.get("/api/mails/{mail_id}")
 def get_mail_detail(
     mail_id: int,
+    request: Request,
     mark_read: bool = Query(True, description="Whether to mark the email as read upon fetching"),
     db: Session = Depends(get_db)
 ):
@@ -2153,7 +2681,11 @@ def get_mail_detail(
     if not m:
         raise HTTPException(status_code=404, detail="Mail not found")
 
-    if mark_read and not m.is_read:
+    is_csrf_safe_header = request.headers.get("x-requested-with", "").strip().lower() == "prismmail"
+    effective_mark_read = bool(mark_read) and (
+        getattr(request.state, "auth_type", "") != "session" or is_csrf_safe_header
+    )
+    if effective_mark_read and not m.is_read:
         m.is_read = True
         db.commit()
 
@@ -2180,10 +2712,25 @@ def get_mail_detail(
     }
 
 
+def _is_allowed_mail_storage_file(path_str: str) -> bool:
+    if not path_str or path_str.startswith("imap://") or not os.path.isfile(path_str):
+        return False
+    norm_cand = os.path.normcase(os.path.realpath(path_str))
+    for allowed_base in (ATTACHMENT_CACHE_DIR, VMAIL_DIR):
+        if allowed_base and os.path.exists(allowed_base):
+            norm_base = os.path.normcase(os.path.realpath(allowed_base))
+            try:
+                if os.path.commonpath([norm_base, norm_cand]) == norm_base:
+                    return True
+            except ValueError:
+                continue
+    return False
+
+
 def load_raw_mime_message(db: Session, m: Mail):
     """Resolve and parse the underlying raw MIME EmailMessage from local Maildir, local cache, or IMAP."""
     # 1. Direct local file check (covers local Maildir and already-cached IMAP/Sent .eml files)
-    if m.maildir_path and not m.maildir_path.startswith("imap://") and os.path.isfile(m.maildir_path):
+    if m.maildir_path and _is_allowed_mail_storage_file(m.maildir_path):
         try:
             with open(m.maildir_path, "rb") as f:
                 return email.message_from_binary_file(f, policy=policy.default)
@@ -2223,7 +2770,7 @@ def load_raw_mime_message(db: Session, m: Mail):
                 for fname in os.listdir(sdir):
                     if fname.split(":2,")[0] == base_key:
                         candidate = os.path.join(sdir, fname)
-                        if os.path.isfile(candidate):
+                        if not os.path.islink(candidate) and _is_allowed_mail_storage_file(candidate):
                             m.maildir_path = candidate
                             db.commit()
                             with open(candidate, "rb") as f:
@@ -2233,16 +2780,22 @@ def load_raw_mime_message(db: Session, m: Mail):
     if mb and mb.is_external and m.maildir_key and m.maildir_key.startswith("imap:"):
         parts = m.maildir_key.split(":", 2)
         if len(parts) == 3:
-            uid_str = parts[2]
-            imap_cache = os.path.join(ATTACHMENT_CACHE_DIR, f"imap_{mb.id}_{uid_str}.eml")
+            uid_str = parts[2].strip()
+            if not uid_str.isdigit():
+                return None
+            safe_uid = uid_str
+            imap_cache = os.path.join(ATTACHMENT_CACHE_DIR, f"imap_{mb.id}_{safe_uid}.eml")
             if os.path.isfile(imap_cache):
                 with open(imap_cache, "rb") as f:
                     return email.message_from_binary_file(f, policy=policy.default)
 
-            if mb.imap_host and mb.auth_password:
+            ext_pwd = mb.get_auth_password()
+            if mb.imap_host and ext_pwd:
                 try:
-                    imap = imaplib.IMAP4_SSL(mb.imap_host, int(mb.imap_port or 993), timeout=18)
-                    imap.login(mb.address, mb.auth_password)
+                    imap_ip = validate_external_mail_endpoint(mb.imap_host, int(mb.imap_port or 993))
+                    ssl_ctx = ssl.create_default_context()
+                    imap = SafeIMAP4_SSL(mb.imap_host, int(mb.imap_port or 993), imap_ip, ssl_ctx, timeout=18)
+                    imap.login(mb.address, ext_pwd)
                     try:
                         imap._simple_command("ID", '("name" "PrismMail" "version" "3.2" "vendor" "PrismMail")')
                     except Exception:
@@ -2262,13 +2815,14 @@ def load_raw_mime_message(db: Session, m: Mail):
                         pass
 
                     if raw_bytes:
-                        with open(imap_cache, "wb") as ef:
-                            ef.write(raw_bytes)
+                        _write_private_bytes(imap_cache, raw_bytes)
                         m.maildir_path = imap_cache
                         db.commit()
                         return email.message_from_bytes(raw_bytes, policy=policy.default)
+                except HTTPException:
+                    raise
                 except Exception as e:
-                    raise HTTPException(status_code=502, detail=f"从外部 IMAP 服务器拉取原始邮件附件失败: {e}")
+                    raise HTTPException(status_code=502, detail=f"从外部 IMAP 服务器拉取原始邮件附件失败 ({type(e).__name__})")
 
     return None
 
@@ -2285,6 +2839,7 @@ def build_content_disposition(filename: str, inline: bool = False) -> str:
 @app.get("/api/agent/mails/{mail_id}/attachments", tags=["Agent Harness API"])
 def list_or_inspect_mail_attachments(
     mail_id: int,
+    request: Request,
     include_base64: bool = Query(False, description="是否内联返回附件的 base64 内容（适合中小文件供 Agent 一步获取）"),
     extract_text: bool = Query(False, description="是否自动提取文本类/PDF 附件的纯文本内容供 AI 阅读"),
     max_base64_mb: int = Query(15, ge=1, le=50, description="内联 base64 的单附件体积上限 (MB)"),
@@ -2294,6 +2849,7 @@ def list_or_inspect_mail_attachments(
     m = db.query(Mail).filter(Mail.id == mail_id, Mail.is_deleted == False).first()
     if not m:
         raise HTTPException(status_code=404, detail="Mail not found")
+    _check_agent_policy(request, target_address=m.mailbox.address if m.mailbox else "")
 
     if not m.has_attachments and not m.attachments:
         return {"mail_id": m.id, "count": 0, "items": []}
@@ -2333,11 +2889,21 @@ def list_or_inspect_mail_attachments(
     return {"mail_id": m.id, "count": len(items), "raw_available": True, "items": items}
 
 
+SAFE_INLINE_CONTENT_TYPES = {
+    "application/pdf",
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+}
+
+
 @app.get("/api/mails/{mail_id}/attachments/{attachment_index}")
 @app.get("/api/agent/mails/{mail_id}/attachments/{attachment_index}", tags=["Agent Harness API"])
 def download_mail_attachment(
     mail_id: int,
     attachment_index: int,
+    request: Request,
     inline: bool = Query(False, description="true 为浏览器内联预览（如 PDF/图片），false 为触发文件下载"),
     db: Session = Depends(get_db)
 ):
@@ -2345,6 +2911,7 @@ def download_mail_attachment(
     m = db.query(Mail).filter(Mail.id == mail_id, Mail.is_deleted == False).first()
     if not m:
         raise HTTPException(status_code=404, detail="Mail not found")
+    _check_agent_policy(request, target_address=m.mailbox.address if m.mailbox else "")
 
     msg = load_raw_mime_message(db, m)
     if not msg:
@@ -2356,14 +2923,29 @@ def download_mail_attachment(
 
     target = parsed_atts[attachment_index]
     raw_bytes: bytes = target["raw_bytes"]
+    ctype_low = (target["content_type"] or "application/octet-stream").split(";", 1)[0].strip().lower()
+    allow_inline = bool(inline and ctype_low in SAFE_INLINE_CONTENT_TYPES)
+    if allow_inline and ctype_low == "application/pdf":
+        att_csp = "default-src 'none'; object-src 'self'; frame-ancestors 'self'"
+    else:
+        att_csp = "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; sandbox"
     headers = {
-        "Content-Disposition": build_content_disposition(target["name"], inline=inline),
+        "Content-Disposition": build_content_disposition(target["name"], inline=allow_inline),
         "Content-Length": str(len(raw_bytes)),
         "X-Attachment-Name": quote(target["name"], safe=""),
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": att_csp,
+        "X-Frame-Options": "SAMEORIGIN",
     }
     return Response(content=raw_bytes, media_type=target["content_type"], headers=headers)
 
 # ----------------- REAL SMTP OUTBOUND SENDING -----------------
+MAX_ATTACHMENT_COUNT = 10
+MAX_SINGLE_ATTACHMENT_BYTES = 15 * 1024 * 1024
+MAX_TOTAL_ATTACHMENTS_BYTES = 25 * 1024 * 1024
+_MIME_TYPE_RE = re.compile(r"^[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+$")
+
+
 class OutboundAttachmentInput(BaseModel):
     filename: str = Field(..., description="附件文件名，如 report.pdf")
     content_base64: str = Field(..., description="附件二进制内容的 Base64 编码字符串")
@@ -2389,12 +2971,28 @@ def deliver_and_record_outbound_mail(
     attachments: Optional[List[OutboundAttachmentInput]] = None,
 ) -> Mail:
     sender_addr = mailbox.address
-    recipient_addr = recipient_addr.strip()
-    plain_content = body_text or html_to_plain_text(body_html) or subject
+    recipient_addr = (recipient_addr or "").strip()
+    clean_subject = (subject or "").strip()
+    if any(ch in recipient_addr for ch in ("\r", "\n", "\x00")) or any(ch in clean_subject for ch in ("\r", "\n", "\x00")):
+        raise HTTPException(status_code=400, detail="收件人或邮件主题不能包含换行符或控制字符")
+    parsed_rcpts = getaddresses([recipient_addr])
+    if (
+        len(parsed_rcpts) != 1
+        or not parsed_rcpts[0][1]
+        or "@" not in parsed_rcpts[0][1]
+        or ";" in recipient_addr
+    ):
+        raise HTTPException(status_code=400, detail="请输入有效的收件人邮箱地址")
+
+    att_list = attachments or []
+    if len(att_list) > MAX_ATTACHMENT_COUNT:
+        raise HTTPException(status_code=400, detail=f"单封邮件最多允许携带 {MAX_ATTACHMENT_COUNT} 个附件")
+
+    plain_content = body_text or html_to_plain_text(body_html) or clean_subject
     html_content = body_html or f"<div>{html.escape(plain_content).replace(chr(10), '<br/>')}</div>"
 
     msg = EmailMessage()
-    msg["Subject"] = subject
+    msg["Subject"] = clean_subject
     msg["From"] = sender_addr
     msg["To"] = recipient_addr
     msg.set_content(plain_content)
@@ -2402,17 +3000,31 @@ def deliver_and_record_outbound_mail(
         msg.add_alternative(html_content, subtype="html")
 
     recorded_atts: List[Dict[str, Any]] = []
-    for idx, att in enumerate(attachments or []):
-        fname = os.path.basename((att.filename or "").strip()) or f"attachment_{idx}"
+    total_att_bytes = 0
+    max_b64_chars = (MAX_SINGLE_ATTACHMENT_BYTES * 4 // 3) + 1024
+    for idx, att in enumerate(att_list):
+        fname = _sanitize_attachment_filename(att.filename, idx)
         b64_str = (att.content_base64 or "").strip()
         if "," in b64_str and b64_str.lower().startswith("data:"):
             b64_str = b64_str.split(",", 1)[1]
+        if len(b64_str) > max_b64_chars:
+            raise HTTPException(status_code=413, detail=f"附件 {fname} 超过单文件 15 MB 大小限制")
         try:
-            raw_b = base64.b64decode(b64_str)
+            raw_b = base64.b64decode(b64_str, validate=True)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"附件 {fname} 的 Base64 解码失败: {e}")
 
-        ctype = (att.content_type or "").strip() or mimetypes.guess_type(fname)[0] or "application/octet-stream"
+        if len(raw_b) > MAX_SINGLE_ATTACHMENT_BYTES:
+            raise HTTPException(status_code=413, detail=f"附件 {fname} 超过单文件 15 MB 大小限制")
+        total_att_bytes += len(raw_b)
+        if total_att_bytes > MAX_TOTAL_ATTACHMENTS_BYTES:
+            raise HTTPException(status_code=413, detail="附件总体积超过 25 MB 限制")
+
+        raw_ct = (att.content_type or "").split(";", 1)[0].strip().lower()
+        if _MIME_TYPE_RE.match(raw_ct):
+            ctype = raw_ct
+        else:
+            ctype = (mimetypes.guess_type(fname)[0] or "application/octet-stream").lower()
         maintype, subtype = ctype.split("/", 1) if "/" in ctype else ("application", "octet-stream")
         msg.add_attachment(raw_b, maintype=maintype, subtype=subtype, filename=fname)
         recorded_atts.append({
@@ -2423,38 +3035,45 @@ def deliver_and_record_outbound_mail(
             "size_bytes": len(raw_b),
         })
 
-    if mailbox.is_external and mailbox.smtp_host and mailbox.auth_password:
+    ext_pwd = mailbox.get_auth_password()
+    if mailbox.is_external and mailbox.smtp_host and ext_pwd:
         try:
             smtp_port = int(mailbox.smtp_port or 465)
+            smtp_ip = validate_external_mail_endpoint(mailbox.smtp_host, smtp_port)
+            ssl_ctx = ssl.create_default_context()
             if smtp_port == 465:
-                with smtplib.SMTP_SSL(mailbox.smtp_host, smtp_port, timeout=20) as s:
-                    s.login(sender_addr, mailbox.auth_password)
+                with SafeSMTP_SSL(mailbox.smtp_host, smtp_port, smtp_ip, ssl_ctx, timeout=20) as s:
+                    s.login(sender_addr, ext_pwd)
                     s.send_message(msg)
             else:
-                with smtplib.SMTP(mailbox.smtp_host, smtp_port, timeout=20) as s:
+                with SafeSMTP(mailbox.smtp_host, smtp_port, smtp_ip, timeout=20) as s:
                     s.ehlo()
-                    s.starttls()
+                    s.starttls(context=ssl_ctx)
                     s.ehlo()
-                    s.login(sender_addr, mailbox.auth_password)
+                    s.login(sender_addr, ext_pwd)
                     s.send_message(msg)
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(
                 status_code=502,
-                detail=f"外部邮箱 ({sender_addr} -> {mailbox.smtp_host}:{mailbox.smtp_port}) SMTP 发信失败: {e}"
+                detail=f"外部邮箱 ({sender_addr} -> {mailbox.smtp_host}:{mailbox.smtp_port}) SMTP 发信失败 ({type(e).__name__})"
             )
     else:
         try:
             with smtplib.SMTP("127.0.0.1", 25, timeout=15) as s:
                 s.send_message(msg)
         except Exception as e:
-            print(f"SMTP delivery notice (saving local): {e}")
+            if os.environ.get("PRISM_DEV_ALLOW_LOCAL_SAVE", "").strip() != "1":
+                raise HTTPException(status_code=502, detail=f"本地 Postfix 投递失败: {e}")
+            print(f"SMTP delivery notice (dev local save): {e}")
 
     new_mail = Mail(
         mailbox_id=mailbox.id,
         folder="sent",
         sender=sender_addr,
         recipient=recipient_addr,
-        subject=subject,
+        subject=clean_subject,
         preview=build_clean_preview(plain_content, html_content),
         body_html=html_content,
         body_text=plain_content,
@@ -2471,8 +3090,7 @@ def deliver_and_record_outbound_mail(
     if recorded_atts:
         try:
             sent_eml = os.path.join(ATTACHMENT_CACHE_DIR, f"mail_{new_mail.id}.eml")
-            with open(sent_eml, "wb") as ef:
-                ef.write(msg.as_bytes())
+            _write_private_bytes(sent_eml, msg.as_bytes())
             new_mail.maildir_path = sent_eml
             db.commit()
         except Exception:
@@ -2514,6 +3132,8 @@ def update_mail(mail_id: int, payload: MailUpdate, db: Session = Depends(get_db)
     if payload.is_starred is not None:
         m.is_starred = payload.is_starred
     if payload.folder is not None:
+        if payload.folder not in ("inbox", "sent", "drafts", "trash"):
+            raise HTTPException(status_code=400, detail="无效的文件夹名称")
         m.folder = payload.folder
     if payload.tags is not None:
         m.tags = payload.tags
@@ -2528,11 +3148,12 @@ def delete_mail(mail_id: int, permanent: bool = False, db: Session = Depends(get
         raise HTTPException(status_code=404, detail="Mail not found")
 
     if permanent or m.folder == "trash":
-        # Soft-delete + remove underlying Maildir file so sync_maildir_to_db never resurrects it
+        # Soft-delete + remove underlying Maildir/cache file so sync_maildir_to_db never resurrects it
         m.is_deleted = True
-        if m.maildir_path and os.path.isfile(m.maildir_path):
+        _cleanup_mail_cache_files([m])
+        if m.maildir_path and _is_allowed_mail_storage_file(m.maildir_path):
             try:
-                os.remove(m.maildir_path)
+                os.remove(os.path.realpath(m.maildir_path))
             except Exception:
                 pass
     else:
@@ -2675,8 +3296,28 @@ def get_agent_api_spec():
         ]
     }
 
+def _check_agent_policy(request: Request, target_address: Optional[str] = None, is_send: bool = False) -> Optional[dict]:
+    if getattr(request.state, "auth_type", "") != "api_key":
+        return None
+    pol = get_agent_policy()
+    if is_send and not pol.get("allow_send", True):
+        raise HTTPException(status_code=403, detail="当前 API Key 策略禁止发信或写操作")
+    allowed = pol.get("allowed_addresses") or []
+    if allowed and target_address is not None:
+        if target_address.strip().lower() not in allowed:
+            raise HTTPException(status_code=403, detail="当前 API Key 无权访问该邮箱")
+    return pol
+
+
+def _is_csrf_safe_get_mutation(request: Request) -> bool:
+    if getattr(request.state, "auth_type", "") != "session":
+        return True
+    return request.headers.get("x-requested-with", "").strip().lower() == "prismmail"
+
+
 @app.get("/api/agent/mails", tags=["Agent Harness API"])
 def agent_list_mails(
+    request: Request,
     address: Optional[str] = Query(None, description="邮箱地址或前缀，如 admin@example.com 或 admin"),
     mailbox_id: Optional[int] = Query(None, description="邮箱 ID"),
     domain: Optional[str] = Query(None, description="域名过滤，如 example.com"),
@@ -2694,7 +3335,9 @@ def agent_list_mails(
     db: Session = Depends(get_db)
 ):
     """Query emails for AI Agents (Hermes) with clean plain text and extracted codes/links."""
-    sync_maildir_to_db(db, force=True)
+    pol = _check_agent_policy(request)
+    allow_get_mutation = _is_csrf_safe_get_mutation(request)
+    sync_maildir_to_db(db, force=allow_get_mutation)
     q = db.query(Mail).filter(Mail.is_deleted == False)
 
     if folder != "all":
@@ -2712,6 +3355,9 @@ def agent_list_mails(
         dom = domain.strip().lower()
         q = q.join(Mailbox).join(Domain).filter(Domain.name == dom)
 
+    if pol and pol.get("allowed_addresses"):
+        q = q.filter(Mail.mailbox.has(Mailbox.address.in_(pol["allowed_addresses"])))
+
     if unread_only:
         q = q.filter(Mail.is_read == False)
 
@@ -2720,17 +3366,17 @@ def agent_list_mails(
         q = q.filter(Mail.created_at >= since_dt)
 
     if sender:
-        q = q.filter(Mail.sender.ilike(f"%{sender.strip()}%"))
+        q = q.filter(Mail.sender.ilike(f"%{_escape_like(sender.strip())}%", escape="\\"))
     if subject:
-        q = q.filter(Mail.subject.ilike(f"%{subject.strip()}%"))
+        q = q.filter(Mail.subject.ilike(f"%{_escape_like(subject.strip())}%", escape="\\"))
     if search:
-        p = f"%{search.strip()}%"
+        p = f"%{_escape_like(search.strip())}%"
         q = q.filter(
             or_(
-                Mail.subject.ilike(p),
-                Mail.sender.ilike(p),
-                Mail.recipient.ilike(p),
-                Mail.body_text.ilike(p)
+                Mail.subject.ilike(p, escape="\\"),
+                Mail.sender.ilike(p, escape="\\"),
+                Mail.recipient.ilike(p, escape="\\"),
+                Mail.body_text.ilike(p, escape="\\")
             )
         )
 
@@ -2739,7 +3385,7 @@ def agent_list_mails(
 
     items = [serialize_agent_mail(m, include_body=include_body, include_html=include_html) for m in mails]
 
-    if mark_read and mails:
+    if mark_read and allow_get_mutation and mails:
         for m in mails:
             if not m.is_read:
                 m.is_read = True
@@ -2750,6 +3396,7 @@ def agent_list_mails(
 @app.get("/api/agent/mails/latest", tags=["Agent Harness API"])
 @app.get("/api/agent/code", tags=["Agent Harness API"])
 def agent_get_latest_mail_or_code(
+    request: Request,
     address: Optional[str] = Query(None, description="目标邮箱地址或前缀，如 verify@example.com"),
     sender: Optional[str] = Query(None, description="发件人过滤，如 openai 或 noreply"),
     subject: Optional[str] = Query(None, description="主题过滤"),
@@ -2759,7 +3406,9 @@ def agent_get_latest_mail_or_code(
     db: Session = Depends(get_db)
 ):
     """Fetch the single newest matching email with extracted verification code and links."""
-    sync_maildir_to_db(db, force=True)
+    pol = _check_agent_policy(request)
+    allow_get_mutation = _is_csrf_safe_get_mutation(request)
+    sync_maildir_to_db(db, force=allow_get_mutation)
     q = db.query(Mail).filter(Mail.is_deleted == False, Mail.folder == "inbox")
 
     if address:
@@ -2769,22 +3418,37 @@ def agent_get_latest_mail_or_code(
         else:
             q = q.join(Mailbox).filter(Mailbox.prefix == addr)
 
+    if pol and pol.get("allowed_addresses"):
+        q = q.filter(Mail.mailbox.has(Mailbox.address.in_(pol["allowed_addresses"])))
+
     if sender:
-        q = q.filter(Mail.sender.ilike(f"%{sender.strip()}%"))
+        q = q.filter(Mail.sender.ilike(f"%{_escape_like(sender.strip())}%", escape="\\"))
     if subject:
-        q = q.filter(Mail.subject.ilike(f"%{subject.strip()}%"))
+        q = q.filter(Mail.subject.ilike(f"%{_escape_like(subject.strip())}%", escape="\\"))
     if unread_only:
         q = q.filter(Mail.is_read == False)
     if within_minutes is not None and within_minutes > 0:
         cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=within_minutes)
         q = q.filter(Mail.created_at >= cutoff)
 
-    m = q.order_by(Mail.created_at.desc(), Mail.id.desc()).first()
+    is_code_endpoint = request.url.path.rstrip("/") == "/api/agent/code"
+    if is_code_endpoint:
+        candidates = q.order_by(Mail.created_at.desc(), Mail.id.desc()).limit(10).all()
+        m = None
+        for cand in candidates:
+            if extract_verification_codes(cand.subject, cand.body_text):
+                m = cand
+                break
+        if m is None and candidates:
+            m = candidates[0]
+    else:
+        m = q.order_by(Mail.created_at.desc(), Mail.id.desc()).first()
+
     if not m:
         return {"found": False, "mail": None, "verification_code": None, "links": []}
 
     data = serialize_agent_mail(m, include_body=True, include_html=False)
-    if mark_read and not m.is_read:
+    if mark_read and allow_get_mutation and not m.is_read:
         m.is_read = True
         db.commit()
 
@@ -2799,6 +3463,7 @@ def agent_get_latest_mail_or_code(
 @app.get("/api/agent/mails/{mail_id}", tags=["Agent Harness API"])
 def agent_get_mail_detail(
     mail_id: int,
+    request: Request,
     mark_read: bool = Query(False, description="读取后是否标记为已读（默认 false，方便无痕读取）"),
     include_html: bool = Query(True, description="是否包含原始 HTML"),
     db: Session = Depends(get_db)
@@ -2808,8 +3473,9 @@ def agent_get_mail_detail(
     m = db.query(Mail).filter(Mail.id == mail_id, Mail.is_deleted == False).first()
     if not m:
         raise HTTPException(status_code=404, detail="Mail not found")
+    _check_agent_policy(request, target_address=m.mailbox.address if m.mailbox else "")
 
-    if mark_read and not m.is_read:
+    if mark_read and _is_csrf_safe_get_mutation(request) and not m.is_read:
         m.is_read = True
         db.commit()
 
@@ -2826,6 +3492,7 @@ class AgentMailSummaryPayload(BaseModel):
 @app.post("/api/agent/mails/{mail_id}/summary", tags=["Agent Harness API"])
 def agent_read_or_write_mail_summary(
     mail_id: int,
+    request: Request,
     payload: Optional[AgentMailSummaryPayload] = None,
     db: Session = Depends(get_db)
 ):
@@ -2836,6 +3503,7 @@ def agent_read_or_write_mail_summary(
     m = db.query(Mail).filter(Mail.id == mail_id, Mail.is_deleted == False).first()
     if not m:
         raise HTTPException(status_code=404, detail="Mail not found")
+    _check_agent_policy(request, target_address=m.mailbox.address if m.mailbox else "")
 
     codes = extract_verification_codes(m.subject, m.body_text)
     links = extract_links(m.body_text, m.body_html)
@@ -2875,11 +3543,11 @@ def agent_read_or_write_mail_summary(
     }
 
 @app.post("/api/agent/summarize", tags=["Agent Harness API"])
-def agent_summarize_endpoint(payload: AgentMailSummaryPayload, db: Session = Depends(get_db)):
+def agent_summarize_endpoint(payload: AgentMailSummaryPayload, request: Request, db: Session = Depends(get_db)):
     """Backwards-compatible endpoint returning structured email content for external AI summarization."""
     if not payload.mail_id:
         raise HTTPException(status_code=400, detail="mail_id is required")
-    return agent_read_or_write_mail_summary(payload.mail_id, payload, db)
+    return agent_read_or_write_mail_summary(payload.mail_id, request, payload, db)
 
 class AgentSendMailPayload(BaseModel):
     from_address: Optional[str] = Field(None, description="发件邮箱地址，如 admin@example.com")
@@ -2892,21 +3560,29 @@ class AgentSendMailPayload(BaseModel):
     auto_create_mailbox: bool = Field(True, description="若发件邮箱不存在，是否在同一域名下自动创建")
 
 @app.post("/api/agent/send", tags=["Agent Harness API"])
-def agent_send_mail(payload: AgentSendMailPayload, db: Session = Depends(get_db)):
+def agent_send_mail(payload: AgentSendMailPayload, request: Request, db: Session = Depends(get_db)):
     """Send an email directly from an Agent harness using `from_address` or `mailbox_id`."""
+    pol = _check_agent_policy(request, is_send=True)
     mailbox = None
     if payload.mailbox_id:
         mailbox = db.query(Mailbox).filter(Mailbox.id == payload.mailbox_id).first()
     elif payload.from_address:
         addr = payload.from_address.strip().lower()
         if "@" not in addr:
-            default_dom = db.query(Domain).first()
-            addr = f"{addr}@{default_dom.name if default_dom else 'example.com'}"
+            pfx = validate_mailbox_prefix(addr)
+            default_dom = db.query(Domain).filter(Domain.is_external == False).first() or db.query(Domain).first()
+            dom_name = default_dom.name if default_dom else "example.com"
+            addr = f"{pfx}@{dom_name}"
+        else:
+            raw_pfx, raw_dom = addr.split("@", 1)
+            pfx = validate_mailbox_prefix(raw_pfx)
+            dom_name = validate_domain_name(raw_dom)
+            addr = f"{pfx}@{dom_name}"
+        _check_agent_policy(request, target_address=addr, is_send=True)
         mailbox = db.query(Mailbox).filter(Mailbox.address == addr).first()
         if not mailbox and payload.auto_create_mailbox:
-            pfx, dom_name = addr.split("@", 1)
             dom = db.query(Domain).filter(Domain.name == dom_name).first()
-            if dom:
+            if dom and not getattr(dom, "is_external", False):
                 mailbox = Mailbox(
                     domain_id=dom.id,
                     prefix=pfx,
@@ -2919,10 +3595,14 @@ def agent_send_mail(payload: AgentSendMailPayload, db: Session = Depends(get_db)
                 db.refresh(mailbox)
                 provision_system_mailbox(dom.name, pfx)
     else:
-        mailbox = db.query(Mailbox).filter(Mailbox.is_default == True).first() or db.query(Mailbox).first()
+        mb_q = db.query(Mailbox)
+        if pol and pol.get("allowed_addresses"):
+            mb_q = mb_q.filter(Mailbox.address.in_(pol["allowed_addresses"]))
+        mailbox = mb_q.filter(Mailbox.is_default == True).first() or mb_q.first()
 
     if not mailbox:
         raise HTTPException(status_code=404, detail="未找到可用的发件邮箱")
+    _check_agent_policy(request, target_address=mailbox.address, is_send=True)
 
     sent = deliver_and_record_outbound_mail(
         db=db,
@@ -2952,8 +3632,9 @@ class AgentReplyMailPayload(BaseModel):
     attachments: Optional[List[OutboundAttachmentInput]] = Field(None, description="可选回复附件列表（Base64）")
 
 @app.post("/api/agent/reply", tags=["Agent Harness API"])
-def agent_reply_mail(payload: AgentReplyMailPayload, db: Session = Depends(get_db)):
+def agent_reply_mail(payload: AgentReplyMailPayload, request: Request, db: Session = Depends(get_db)):
     """Reply to an existing email by mail_id from an external AI Agent."""
+    _check_agent_policy(request, is_send=True)
     orig = db.query(Mail).filter(Mail.id == payload.mail_id, Mail.is_deleted == False).first()
     if not orig:
         raise HTTPException(status_code=404, detail="Original mail not found")
@@ -2961,6 +3642,7 @@ def agent_reply_mail(payload: AgentReplyMailPayload, db: Session = Depends(get_d
     mailbox = orig.mailbox or db.query(Mailbox).filter(Mailbox.id == orig.mailbox_id).first()
     if not mailbox:
         raise HTTPException(status_code=404, detail="Mailbox for original mail not found")
+    _check_agent_policy(request, target_address=mailbox.address, is_send=True)
 
     reply_to_addr = parseaddr(orig.sender)[1] or orig.sender
     subj = payload.subject or (orig.subject if orig.subject.lower().startswith("re:") else f"Re: {orig.subject}")
@@ -2987,10 +3669,14 @@ def agent_reply_mail(payload: AgentReplyMailPayload, db: Session = Depends(get_d
     }
 
 @app.get("/api/agent/mailboxes", tags=["Agent Harness API"])
-def agent_list_mailboxes(db: Session = Depends(get_db)):
+def agent_list_mailboxes(request: Request, db: Session = Depends(get_db)):
     """List all mailboxes and their unread counts for AI Agents."""
+    pol = _check_agent_policy(request)
     sync_maildir_to_db(db)
-    mbs = db.query(Mailbox).all()
+    q = db.query(Mailbox)
+    if pol and pol.get("allowed_addresses"):
+        q = q.filter(Mailbox.address.in_(pol["allowed_addresses"]))
+    mbs = q.all()
     items = []
     for m in mbs:
         unread = db.query(Mail).filter(
@@ -3020,29 +3706,37 @@ class AgentMailboxCreatePayload(BaseModel):
     role: Optional[str] = Field("bot", description="角色类型：bot | personal | admin | alert | billing")
 
 @app.post("/api/agent/mailboxes", tags=["Agent Harness API"])
-def agent_create_mailbox(payload: AgentMailboxCreatePayload, db: Session = Depends(get_db)):
+def agent_create_mailbox(payload: AgentMailboxCreatePayload, request: Request, db: Session = Depends(get_db)):
     """One-call mailbox provisioning for AI Agents (creates DB record + Maildir + Postfix + Dovecot)."""
+    _check_agent_policy(request, is_send=True)
     if payload.address and "@" in payload.address:
-        pfx, dom_name = payload.address.strip().lower().split("@", 1)
+        raw_pfx, raw_dom = payload.address.strip().lower().split("@", 1)
+        pfx = validate_mailbox_prefix(raw_pfx)
+        dom_name = validate_domain_name(raw_dom)
     else:
-        pfx = (payload.prefix or payload.address or "").strip().lower()
-        dom_name = (payload.domain or "").strip().lower()
-
-    if not pfx:
-        raise HTTPException(status_code=400, detail="请提供 address 或 prefix")
+        raw_pfx = (payload.prefix or payload.address or "").strip().lower()
+        if not raw_pfx:
+            raise HTTPException(status_code=400, detail="请提供 address 或 prefix")
+        pfx = validate_mailbox_prefix(raw_pfx)
+        raw_dom = (payload.domain or "").strip().lower()
+        dom_name = validate_domain_name(raw_dom) if raw_dom else ""
 
     if dom_name:
         domain = db.query(Domain).filter(Domain.name == dom_name).first()
     else:
-        domain = db.query(Domain).first()
+        domain = db.query(Domain).filter(Domain.is_external == False).first()
 
     if not domain:
         raise HTTPException(status_code=404, detail="Domain not found")
+    if getattr(domain, "is_external", False):
+        raise HTTPException(status_code=400, detail="外部互联域名不支持直接开通本地系统邮箱")
 
     full_address = f"{pfx}@{domain.name}"
+    _check_agent_policy(request, target_address=full_address, is_send=True)
     existing = db.query(Mailbox).filter(Mailbox.address == full_address).first()
     if existing:
-        provision_system_mailbox(domain.name, pfx)
+        if not existing.is_external:
+            provision_system_mailbox(domain.name, pfx)
         return {
             "status": "exists",
             "id": existing.id,
@@ -3097,20 +3791,32 @@ def mount_spa_edition(url_prefix: str, dist_dir: str):
     """Mount a standalone Vite SPA build at /<url_prefix>."""
     if not os.path.exists(dist_dir):
         return
-    ed_assets = os.path.join(dist_dir, "assets")
+    real_dist = os.path.realpath(dist_dir)
+    norm_dist = os.path.normcase(real_dist)
+
+    ed_assets = os.path.join(real_dist, "assets")
     if os.path.exists(ed_assets):
         app.mount(f"/{url_prefix}/assets", StaticFiles(directory=ed_assets), name=f"{url_prefix}_assets")
 
-    def _serve_root(_dir: str = dist_dir):
-        return FileResponse(os.path.join(_dir, "index.html"))
+    def _redirect_slash(_prefix: str = url_prefix):
+        return RedirectResponse(url=f"/{_prefix}/", status_code=302)
 
-    def _serve_sub(sub_path: str, _dir: str = dist_dir):
-        target = os.path.join(_dir, sub_path)
-        if os.path.isfile(target):
-            return FileResponse(target)
-        return FileResponse(os.path.join(_dir, "index.html"))
+    def _serve_root(_root: str = real_dist):
+        return FileResponse(os.path.join(_root, "index.html"))
 
-    app.add_api_route(f"/{url_prefix}", _serve_root, methods=["GET"], include_in_schema=False)
+    def _serve_sub(sub_path: str, _root: str = real_dist, _norm_root: str = norm_dist):
+        raw_rel = sub_path.lstrip("/\\")
+        if "\x00" in raw_rel or os.path.isabs(raw_rel) or ":" in raw_rel.split("/", 1)[0].split("\\", 1)[0]:
+            raise HTTPException(status_code=404, detail="Not found")
+        candidate = os.path.realpath(os.path.join(_root, raw_rel))
+        norm_cand = os.path.normcase(candidate)
+        if os.path.commonpath([_norm_root, norm_cand]) != _norm_root:
+            raise HTTPException(status_code=404, detail="Not found")
+        if os.path.isfile(candidate):
+            return FileResponse(candidate)
+        return FileResponse(os.path.join(_root, "index.html"))
+
+    app.add_api_route(f"/{url_prefix}", _redirect_slash, methods=["GET"], include_in_schema=False)
     app.add_api_route(f"/{url_prefix}/", _serve_root, methods=["GET"], include_in_schema=False)
     app.add_api_route(f"/{url_prefix}/{{sub_path:path}}", _serve_sub, methods=["GET"], include_in_schema=False)
 

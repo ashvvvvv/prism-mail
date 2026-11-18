@@ -31,7 +31,7 @@ LOGIN_SCRIPT_TEMPLATE = """
       try {
         const res = await fetch('/api/auth/login', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'PrismMail' },
           body: JSON.stringify({
             username: document.getElementById('username').value.trim(),
             password: pwInput.value,

@@ -3,6 +3,23 @@ import { defineStore } from 'pinia'
 let toastSeq = 1
 let schemeMediaBound = false
 
+function formatApiDetail(detail, fallbackMsg = '请求失败') {
+  if (typeof detail === 'string' && detail) return detail
+  if (Array.isArray(detail) && detail.length > 0) return detail[0]?.msg || fallbackMsg
+  return fallbackMsg
+}
+
+async function assertOkJson(res, fallbackMsg = '请求失败') {
+  let data = null
+  try {
+    data = await res.json()
+  } catch {}
+  if (!res.ok) {
+    throw new Error(formatApiDetail(data?.detail, fallbackMsg))
+  }
+  return data
+}
+
 function normalizeColorMode(raw) {
   if (raw === 'light' || raw === 'dark' || raw === 'system') return raw
   return 'system'
@@ -266,11 +283,7 @@ export const useMailStore = defineStore('mail', {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       })
-      const data = await res.json()
-      if (!res.ok) {
-        throw new Error(data.detail || '连接测试失败')
-      }
-      return data
+      return await assertOkJson(res, '连接测试失败')
     },
 
     async saveExternalMailbox(payload) {
@@ -279,10 +292,7 @@ export const useMailStore = defineStore('mail', {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       })
-      const data = await res.json()
-      if (!res.ok) {
-        throw new Error(data.detail || '接入外部邮箱失败')
-      }
+      const data = await assertOkJson(res, '接入外部邮箱失败')
       await Promise.all([
         this.fetchDomains(),
         this.fetchGroupedMailboxes(),
@@ -297,19 +307,34 @@ export const useMailStore = defineStore('mail', {
       const res = await fetch(`/api/external-mailboxes/${mailboxId}/sync`, {
         method: 'POST'
       })
-      const data = await res.json()
-      await Promise.all([
-        this.fetchDomains(),
-        this.fetchGroupedMailboxes(),
-        this.fetchMails(),
-        this.fetchCounts()
-      ])
+      let data = null
+      try {
+        data = await res.json()
+      } catch {}
+      const syncStatus = String(data?.sync_status || '')
+      const isSyncError = !res.ok || data?.status === 'error' || syncStatus.startsWith('error')
+      if (res.ok) {
+        await Promise.all([
+          this.fetchDomains(),
+          this.fetchGroupedMailboxes(),
+          this.fetchMails(),
+          this.fetchCounts()
+        ])
+      }
+      if (isSyncError) {
+        const rawDetail =
+          data?.detail ||
+          data?.error ||
+          (syncStatus.startsWith('error') ? syncStatus.replace(/^error:\s*/i, '') : '')
+        throw new Error(formatApiDetail(rawDetail, '同步失败'))
+      }
       return data
     },
 
     async fetchMailboxLabels() {
       try {
         const res = await fetch('/api/mailbox-labels')
+        if (!res.ok) return
         this.mailboxLabels = await res.json()
       } catch (e) {
         console.error('Failed to fetch mailbox labels', e)
@@ -317,28 +342,39 @@ export const useMailStore = defineStore('mail', {
     },
 
     async createMailboxLabel(name, description = '', color = '#3b82f6') {
-      const res = await fetch('/api/mailbox-labels', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, description, color })
-      })
-      const data = await res.json()
-      await this.fetchMailboxLabels()
-      await this.fetchGroupedMailboxes()
-      this.notify(`已创建分组「${name}」`, 'success')
-      return data
+      try {
+        const res = await fetch('/api/mailbox-labels', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, description, color })
+        })
+        const data = await assertOkJson(res, '创建分组失败')
+        await this.fetchMailboxLabels()
+        await this.fetchGroupedMailboxes()
+        this.notify(`已创建分组「${name}」`, 'success')
+        return data
+      } catch (err) {
+        this.notify(err.message || '创建分组失败', 'error')
+        throw err
+      }
     },
 
     async deleteMailboxLabel(labelId) {
-      await fetch(`/api/mailbox-labels/${labelId}`, { method: 'DELETE' })
-      if (this.selectedLabelId === labelId) {
-        this.selectedLabelId = null
+      try {
+        const res = await fetch(`/api/mailbox-labels/${labelId}`, { method: 'DELETE' })
+        await assertOkJson(res, '移除分组失败')
+        if (this.selectedLabelId === labelId) {
+          this.selectedLabelId = null
+        }
+        await this.fetchMailboxLabels()
+        await this.fetchGroupedMailboxes()
+        await this.fetchMails()
+        await this.fetchCounts()
+        this.notify('分组已移除')
+      } catch (err) {
+        this.notify(err.message || '移除分组失败', 'error')
+        throw err
       }
-      await this.fetchMailboxLabels()
-      await this.fetchGroupedMailboxes()
-      await this.fetchMails()
-      await this.fetchCounts()
-      this.notify('分组已移除')
     },
 
     async reorderMailboxLabels(orderedLabelIds) {
@@ -400,20 +436,26 @@ export const useMailStore = defineStore('mail', {
     },
 
     async updateMailboxMetadata(mailboxId, metadata) {
-      const res = await fetch(`/api/mailboxes/${mailboxId}/metadata`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(metadata)
-      })
-      const data = await res.json()
-      await this.fetchGroupedMailboxes()
-      await this.fetchDomains()
-      return data
+      try {
+        const res = await fetch(`/api/mailboxes/${mailboxId}/metadata`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(metadata)
+        })
+        const data = await assertOkJson(res, '更新邮箱设置失败')
+        await this.fetchGroupedMailboxes()
+        await this.fetchDomains()
+        return data
+      } catch (err) {
+        this.notify(err.message || '更新邮箱设置失败', 'error')
+        throw err
+      }
     },
 
     async fetchBranding() {
       try {
         const res = await fetch('/api/org/branding')
+        if (!res.ok) return
         this.branding = await res.json()
       } catch {}
     },
@@ -421,6 +463,7 @@ export const useMailStore = defineStore('mail', {
     async fetchProfile() {
       try {
         const res = await fetch('/api/user/profile')
+        if (!res.ok) return
         this.user = await res.json()
       } catch {}
     },
@@ -428,59 +471,82 @@ export const useMailStore = defineStore('mail', {
     async fetchDomains() {
       try {
         const res = await fetch('/api/domains')
+        if (!res.ok) return
         this.domains = await res.json()
       } catch {}
     },
 
     async createDomain(name, description) {
-      const res = await fetch('/api/domains', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, description })
-      })
-      const data = await res.json()
-      await this.fetchDomains()
-      await this.fetchGroupedMailboxes()
-      this.notify(`域名 @${name} 已添加`, 'success')
-      return data
+      try {
+        const res = await fetch('/api/domains', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, description })
+        })
+        const data = await assertOkJson(res, '添加域名失败')
+        await this.fetchDomains()
+        await this.fetchGroupedMailboxes()
+        this.notify(`域名 @${name} 已添加`, 'success')
+        return data
+      } catch (err) {
+        this.notify(err.message || '添加域名失败', 'error')
+        throw err
+      }
     },
 
     async deleteDomain(domainId) {
-      await fetch(`/api/domains/${domainId}`, { method: 'DELETE' })
-      if (this.selectedDomainId === domainId) {
-        this.selectedDomainId = null
-        this.selectedMailboxId = null
+      try {
+        const res = await fetch(`/api/domains/${domainId}`, { method: 'DELETE' })
+        await assertOkJson(res, '移除域名失败')
+        if (this.selectedDomainId === domainId) {
+          this.selectedDomainId = null
+          this.selectedMailboxId = null
+        }
+        await this.fetchDomains()
+        await this.fetchGroupedMailboxes()
+        await this.fetchMails()
+        await this.fetchCounts()
+        this.notify('域名已移除')
+      } catch (err) {
+        this.notify(err.message || '移除域名失败', 'error')
+        throw err
       }
-      await this.fetchDomains()
-      await this.fetchGroupedMailboxes()
-      await this.fetchMails()
-      await this.fetchCounts()
-      this.notify('域名已移除')
     },
 
     async createMailbox(domainId, prefix, name) {
-      const res = await fetch(`/api/domains/${domainId}/mailboxes`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prefix, name })
-      })
-      const data = await res.json()
-      await this.fetchDomains()
-      await this.fetchGroupedMailboxes()
-      this.notify(`邮箱已开通`, 'success')
-      return data
+      try {
+        const res = await fetch(`/api/domains/${domainId}/mailboxes`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ prefix, name })
+        })
+        const data = await assertOkJson(res, '开通邮箱失败')
+        await this.fetchDomains()
+        await this.fetchGroupedMailboxes()
+        this.notify('邮箱已开通', 'success')
+        return data
+      } catch (err) {
+        this.notify(err.message || '开通邮箱失败', 'error')
+        throw err
+      }
     },
 
     async deleteMailbox(mailboxId) {
-      await fetch(`/api/mailboxes/${mailboxId}`, { method: 'DELETE' })
-      if (this.selectedMailboxId === mailboxId) {
-        this.selectedMailboxId = null
+      try {
+        const res = await fetch(`/api/mailboxes/${mailboxId}`, { method: 'DELETE' })
+        await assertOkJson(res, '删除邮箱失败')
+        if (this.selectedMailboxId === mailboxId) {
+          this.selectedMailboxId = null
+        }
+        await this.fetchDomains()
+        await this.fetchGroupedMailboxes()
+        await this.fetchMails()
+        await this.fetchCounts()
+        this.notify('邮箱已删除')
+      } catch (err) {
+        this.notify(err.message || '删除邮箱失败', 'error')
+        throw err
       }
-      await this.fetchDomains()
-      await this.fetchGroupedMailboxes()
-      await this.fetchMails()
-      await this.fetchCounts()
-      this.notify('邮箱已删除')
     },
 
     async fetchFolders() {
@@ -541,6 +607,7 @@ export const useMailStore = defineStore('mail', {
           params.append('search', this.searchQuery)
         }
         const res = await fetch(`/api/mails?${params.toString()}`)
+        if (!res.ok) return
         const data = await res.json()
         this.mails = data.items || []
         this.totalMails = data.total || 0
@@ -575,6 +642,7 @@ export const useMailStore = defineStore('mail', {
       this.isLoadingDetail = true
       try {
         const res = await fetch(`/api/mails/${mail.id}`)
+        if (!res.ok) return
         const detail = await res.json()
         if (this.selectedMail?.id === mail.id) {
           this.selectedMailDetail = detail
@@ -640,10 +708,7 @@ export const useMailStore = defineStore('mail', {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       })
-      const data = await res.json()
-      if (!res.ok) {
-        throw new Error(data.detail || '发送失败')
-      }
+      const data = await assertOkJson(res, '发送失败')
       await this.fetchMails()
       await this.fetchCounts()
       this.notify('邮件已发出', 'success')
@@ -651,38 +716,50 @@ export const useMailStore = defineStore('mail', {
     },
 
     async updateMailStatus(mailId, updates) {
-      await fetch(`/api/mails/${mailId}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(updates)
-      })
-      const inList = this.mails.find(m => m.id === mailId)
-      if (inList) Object.assign(inList, updates)
-      if (this.selectedMail && this.selectedMail.id === mailId) {
-        Object.assign(this.selectedMail, updates)
-        if (this.selectedMailDetail) {
-          Object.assign(this.selectedMailDetail, updates)
+      try {
+        const res = await fetch(`/api/mails/${mailId}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(updates)
+        })
+        await assertOkJson(res, '更新邮件状态失败')
+        const inList = this.mails.find(m => m.id === mailId)
+        if (inList) Object.assign(inList, updates)
+        if (this.selectedMail && this.selectedMail.id === mailId) {
+          Object.assign(this.selectedMail, updates)
+          if (this.selectedMailDetail) {
+            Object.assign(this.selectedMailDetail, updates)
+          }
         }
+        this.fetchCounts()
+      } catch (err) {
+        this.notify(err.message || '更新邮件状态失败', 'error')
+        throw err
       }
-      this.fetchCounts()
     },
 
     async deleteMail(mailId) {
-      const idx = this.mails.findIndex(m => m.id === mailId)
-      await fetch(`/api/mails/${mailId}`, { method: 'DELETE' })
-      this.mails = this.mails.filter(m => m.id !== mailId)
-      this.totalMails = Math.max(0, this.totalMails - 1)
-      if (this.selectedMail && this.selectedMail.id === mailId) {
-        const nextMail = this.mails[idx] || this.mails[idx - 1] || null
-        if (nextMail && (typeof window === 'undefined' || window.innerWidth >= 1024)) {
-          this.selectMail(nextMail)
-        } else {
-          this.closeMail()
+      try {
+        const idx = this.mails.findIndex(m => m.id === mailId)
+        const res = await fetch(`/api/mails/${mailId}`, { method: 'DELETE' })
+        await assertOkJson(res, '删除邮件失败')
+        this.mails = this.mails.filter(m => m.id !== mailId)
+        this.totalMails = Math.max(0, this.totalMails - 1)
+        if (this.selectedMail && this.selectedMail.id === mailId) {
+          const nextMail = this.mails[idx] || this.mails[idx - 1] || null
+          if (nextMail && (typeof window === 'undefined' || window.innerWidth >= 1024)) {
+            this.selectMail(nextMail)
+          } else {
+            this.closeMail()
+          }
         }
+        this.fetchCounts()
+        this.fetchGroupedMailboxes()
+        this.notify('已移至废纸篓')
+      } catch (err) {
+        this.notify(err.message || '删除邮件失败', 'error')
+        throw err
       }
-      this.fetchCounts()
-      this.fetchGroupedMailboxes()
-      this.notify('已移至废纸篓')
     }
   }
 })
