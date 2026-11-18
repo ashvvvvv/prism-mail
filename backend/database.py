@@ -11,7 +11,16 @@ from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("PRISM_DATA_DIR", BASE_DIR)
 os.makedirs(DATA_DIR, exist_ok=True)
-DATABASE_URL = os.environ.get("PRISM_DATABASE_URL") or f"sqlite:///{os.path.join(DATA_DIR, 'seek_mail.db')}"
+_DEFAULT_DB_PATH = os.path.join(DATA_DIR, "prism_mail.db")
+_LEGACY_DB_PATH = os.path.join(DATA_DIR, "seek_mail.db")
+if not os.environ.get("PRISM_DATABASE_URL") and not os.path.exists(_DEFAULT_DB_PATH) and os.path.exists(_LEGACY_DB_PATH):
+    for _ext in ("", "-wal", "-shm"):
+        if os.path.exists(_LEGACY_DB_PATH + _ext):
+            try:
+                os.replace(_LEGACY_DB_PATH + _ext, _DEFAULT_DB_PATH + _ext)
+            except Exception:
+                pass
+DATABASE_URL = os.environ.get("PRISM_DATABASE_URL") or f"sqlite:///{_DEFAULT_DB_PATH}"
 
 SECRET_PREFIX = "enc:v1:"
 
