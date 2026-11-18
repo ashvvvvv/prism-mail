@@ -1041,8 +1041,8 @@ def register_auth_middleware_and_routes(app: FastAPI) -> None:
             db.refresh(user)
             new_token = create_session_token(user, ttl_seconds=30 * 86400)
 
-        with _REVOKED_SESSION_LOCK:
-            _REVOKED_SESSION_SIGS.clear()
+        # Rotating the signing key already invalidates every prior session.
+        # Keep persisted revocations until their TTL expires.
 
         cred_file = os.path.join(DATA_DIR, ".initial_admin_credentials")
         try:
