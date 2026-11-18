@@ -24,7 +24,13 @@ DATABASE_URL = os.environ.get("PRISM_DATABASE_URL") or f"sqlite:///{_DEFAULT_DB_
 
 SECRET_PREFIX = "enc:v1:"
 
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {})
+if DATABASE_URL.startswith("sqlite"):
+    _sqlite_kwargs = {"connect_args": {"check_same_thread": False, "timeout": 15}}
+    if ":memory:" not in DATABASE_URL and DATABASE_URL != "sqlite://":
+        _sqlite_kwargs.update(pool_size=20, max_overflow=40)
+    engine = create_engine(DATABASE_URL, **_sqlite_kwargs)
+else:
+    engine = create_engine(DATABASE_URL)
 
 
 @event.listens_for(engine, "connect")
@@ -208,6 +214,7 @@ class Mailbox(Base):
     auth_password = Column(Text, default="")
     sync_status = Column(String(100), default="ok")
     imap_uidvalidity = Column(String(50), default="")
+    imap_backfill_cursor = Column(Integer, default=0)
     last_synced_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
@@ -322,6 +329,7 @@ def init_db():
             "ALTER TABLE mailboxes ADD COLUMN auth_password VARCHAR(255) DEFAULT ''",
             "ALTER TABLE mailboxes ADD COLUMN sync_status VARCHAR(100) DEFAULT 'ok'",
             "ALTER TABLE mailboxes ADD COLUMN imap_uidvalidity VARCHAR(50) DEFAULT ''",
+            "ALTER TABLE mailboxes ADD COLUMN imap_backfill_cursor INTEGER DEFAULT 0",
             "ALTER TABLE mailboxes ADD COLUMN last_synced_at DATETIME",
             "ALTER TABLE mails ADD COLUMN is_deleted BOOLEAN DEFAULT 0",
             "ALTER TABLE mails ADD COLUMN maildir_key VARCHAR(255)",

@@ -483,6 +483,66 @@ def extract_links(body_text: str, body_html: str) -> List[str]:
                     return urls
     return urls[:20]
 
+DEFAULT_AGENT_CODE_WINDOW_MINUTES = 30
+MAX_AGENT_CODE_SCAN = 100
+_NON_AUTH_LINK_RE = re.compile(
+    r"(unsubscribe|opt[-_]?out|email[-_]?preferences|manage[-_]?preferences|privacy[-_]?policy|terms[-_]?of[-_]?service)",
+    re.IGNORECASE,
+)
+_HIGH_CONF_AUTH_URL_RE = re.compile(
+    r"(verify|verification|confirm|confirmation|activate|activation|magic[-_]?link|/magic/|callback|reset[-_]?password|forgot[-_]?password|invite|invitation|validate|[?&](?:token|code|key|ticket|otp|magic|hash|sig|signature|auth|nonce|code_challenge)=|/(?:auth|login|signin|sign-in|sso)/[A-Za-z0-9._-]{8,})",
+    re.IGNORECASE,
+)
+_WEAK_AUTH_URL_RE = re.compile(
+    r"(login|signin|sign-in|auth|reset|password|approve|sso)",
+    re.IGNORECASE,
+)
+_AUTH_INTENT_TEXT_RE = re.compile(
+    r"(验证链接|激活链接|登录链接|确认链接|魔术链接|验证您的|激活账号|确认邮箱|完成注册|重置密码|点击.{0,12}(?:登录|验证|激活|确认)|magic\s+link|verify\s+your|confirm\s+your|activate\s+your|sign\s+in\s+to|log\s+in\s+to|login\s+link|verification\s+link|confirmation\s+link|one[- ]time\s+link|reset\s+your\s+password|complete\s+your\s+(?:registration|sign[- ]?up))",
+    re.IGNORECASE,
+)
+
+
+def extract_verification_links(
+    subject: str,
+    body_text: str,
+    body_html: str,
+    all_links: Optional[List[str]] = None,
+) -> List[str]:
+    """Identify credible verification, activation, or magic-login links."""
+    links = all_links if all_links is not None else extract_links(body_text, body_html)
+    if not links:
+        return []
+    non_boilerplate = [u for u in links if not _NON_AUTH_LINK_RE.search(u)]
+    if not non_boilerplate:
+        return []
+    high_conf = [u for u in non_boilerplate if _HIGH_CONF_AUTH_URL_RE.search(u)]
+    if high_conf:
+        return high_conf
+    sample = f"{(subject or '')[:2000]}\n{(body_text or '')[:50000]}"
+    if _AUTH_INTENT_TEXT_RE.search(sample):
+        weak = [u for u in non_boilerplate if _WEAK_AUTH_URL_RE.search(u)]
+        return weak or non_boilerplate
+    return []
+
+
+def prioritize_agent_links(
+    subject: str,
+    body_text: str,
+    body_html: str,
+    all_links: Optional[List[str]] = None,
+) -> List[str]:
+    """Place verification/magic links ahead of general links so links[0] is actionable."""
+    links = all_links if all_links is not None else extract_links(body_text, body_html)
+    if not links:
+        return []
+    auth_links = extract_verification_links(subject, body_text, body_html, all_links=links)
+    if not auth_links:
+        return links
+    auth_set = set(auth_links)
+    return auth_links + [u for u in links if u not in auth_set]
+
+
 def format_utc_iso(dt: Optional[datetime]) -> str:
     """Return an explicit UTC ISO8601 timestamp string ending with Z."""
     if not dt:
@@ -724,9 +784,10 @@ def is_maildir_message_file(filename: str) -> bool:
         return False
     return True
 
-def sync_maildir_to_db(db: Session, force: bool = False):
+def sync_maildir_to_db(db: Session, force: bool = False, sync_external: Optional[bool] = None):
     """Scan /var/vmail and sync real mailboxes and messages into SQLite without false deduplication."""
     global _last_sync_ts
+    do_sync_external = force if sync_external is None else bool(sync_external)
     now_ts = time.time()
     if not force and (now_ts - _last_sync_ts) < 2.0:
         return
@@ -750,23 +811,27 @@ def sync_maildir_to_db(db: Session, force: bool = False):
             db.add(user)
             db.commit()
 
-        # Ensure default business groups and labels exist
+        # Ensure default business groups and labels exist (commit only on insert)
         default_groups = [
             {"name": "核心日常与管理", "icon": "Shield", "color": "#6366f1", "sort_order": 1},
             {"name": "监控与运维告警", "icon": "Activity", "color": "#f59e0b", "sort_order": 2},
             {"name": "AI Agent 自动化", "icon": "Bot", "color": "#a855f7", "sort_order": 3},
             {"name": "账单与财务结算", "icon": "CreditCard", "color": "#10b981", "sort_order": 4},
         ]
+        defaults_dirty = False
         for dg in default_groups:
             grp = db.query(MailboxGroup).filter(MailboxGroup.name == dg["name"]).first()
             if not grp:
                 grp = MailboxGroup(user_id=user.id, **dg)
                 db.add(grp)
+                defaults_dirty = True
             lbl = db.query(MailboxLabel).filter(MailboxLabel.name == dg["name"]).first()
             if not lbl:
                 lbl = MailboxLabel(user_id=user.id, **dg)
                 db.add(lbl)
-        db.commit()
+                defaults_dirty = True
+        if defaults_dirty:
+            db.commit()
 
         grp_core = db.query(MailboxGroup).filter(MailboxGroup.name == "核心日常与管理").first()
         grp_alert = db.query(MailboxGroup).filter(MailboxGroup.name == "监控与运维告警").first()
@@ -889,6 +954,16 @@ def sync_maildir_to_db(db: Session, force: bool = False):
                     ("trash", os.path.join(".Trash", "new"), False),
                 ]
 
+                existing_mail_map = {
+                    m_row.maildir_key: m_row
+                    for m_row in db.query(Mail).filter(
+                        Mail.mailbox_id == mb.id,
+                        Mail.maildir_key.isnot(None),
+                    ).all()
+                    if m_row.maildir_key
+                }
+                mailbox_dirty = False
+
                 for folder_type, rel_sub, is_junk in folder_scan_map:
                     sub_dir = os.path.join(maildir_path, rel_sub)
                     if not os.path.exists(sub_dir):
@@ -905,7 +980,7 @@ def sync_maildir_to_db(db: Session, force: bool = False):
                         maildir_key = f"{mb.id}:{base_key}"
 
                         # 1) Fast check by maildir_key
-                        existing_by_key = db.query(Mail).filter(Mail.maildir_key == maildir_key).first()
+                        existing_by_key = existing_mail_map.get(maildir_key)
                         if existing_by_key:
                             if existing_by_key.is_deleted:
                                 continue
@@ -921,6 +996,7 @@ def sync_maildir_to_db(db: Session, force: bool = False):
                                 dirty = True
                             if dirty:
                                 db.add(existing_by_key)
+                                mailbox_dirty = True
                             continue
 
                         # Parse message file
@@ -990,6 +1066,8 @@ def sync_maildir_to_db(db: Session, force: bool = False):
                                 legacy_row.attachments_json = json.dumps(attachments, ensure_ascii=False)
                             db.add(legacy_row)
                             db.flush()
+                            existing_mail_map[maildir_key] = legacy_row
+                            mailbox_dirty = True
                             continue
 
                         # 3) Otherwise insert new Mail record
@@ -1029,11 +1107,14 @@ def sync_maildir_to_db(db: Session, force: bool = False):
                             created_at=mail_date
                         )
                         db.add(mail_entry)
+                        existing_mail_map[maildir_key] = mail_entry
+                        mailbox_dirty = True
 
-                db.commit()
+                if mailbox_dirty:
+                    db.commit()
 
-    # If force=True (manual refresh or agent query), also trigger external IMAP sync
-    if force:
+    # Trigger full external IMAP sync only when requested (e.g. explicit manual UI refresh)
+    if do_sync_external:
         try:
             sync_all_external_mailboxes(force=True)
         except Exception as e:
@@ -1328,6 +1409,19 @@ def test_external_mailbox_connection(
 
 _ext_sync_lock = threading.Lock()
 _last_ext_sync_ts: float = 0.0
+_ext_mb_locks_guard = threading.Lock()
+_ext_mb_locks: Dict[int, threading.Lock] = {}
+_ext_mb_last_sync_ts: Dict[int, float] = {}
+EXT_TARGETED_SYNC_MIN_INTERVAL_SEC = 5.0
+
+
+def _get_ext_mailbox_lock(mailbox_id: int) -> threading.Lock:
+    with _ext_mb_locks_guard:
+        lock = _ext_mb_locks.get(mailbox_id)
+        if lock is None:
+            lock = threading.Lock()
+            _ext_mb_locks[mailbox_id] = lock
+        return lock
 
 
 def _read_imap_uidvalidity(imap) -> str:
@@ -1341,174 +1435,233 @@ def _read_imap_uidvalidity(imap) -> str:
     return uidvalidity
 
 
-def sync_single_external_mailbox(db: Session, mb: Mailbox, max_fetch: int = 40) -> int:
-    """Pull latest messages via IMAP for a single external mailbox."""
+def sync_single_external_mailbox(
+    db: Session,
+    mb: Mailbox,
+    max_fetch: int = 40,
+    mode: str = "hybrid",
+) -> int:
+    """Pull messages via IMAP with newest-first priority and non-starving cursor backfill."""
     ext_pwd = mb.get_auth_password()
     if not mb.is_external or not mb.imap_host or not ext_pwd:
         return 0
 
+    mb_lock = _get_ext_mailbox_lock(mb.id)
     new_count = 0
-    try:
-        imap_ip = validate_external_mail_endpoint(mb.imap_host, int(mb.imap_port or 993))
-        ssl_ctx = ssl.create_default_context()
-        imap = SafeIMAP4_SSL(mb.imap_host, int(mb.imap_port or 993), imap_ip, ssl_ctx, timeout=15)
-        imap.login(mb.address, ext_pwd)
+    with mb_lock:
+        _ext_mb_last_sync_ts[mb.id] = time.time()
         try:
-            imap._simple_command("ID", '("name" "PrismMail" "version" "3.1" "vendor" "PrismMail")')
-        except Exception:
-            pass
+            imap_ip = validate_external_mail_endpoint(mb.imap_host, int(mb.imap_port or 993))
+            ssl_ctx = ssl.create_default_context()
+            imap = SafeIMAP4_SSL(mb.imap_host, int(mb.imap_port or 993), imap_ip, ssl_ctx, timeout=15)
+            imap.login(mb.address, ext_pwd)
+            try:
+                imap._simple_command("ID", '("name" "PrismMail" "version" "3.1" "vendor" "PrismMail")')
+            except Exception:
+                pass
 
-        typ, _ = imap.select("INBOX", readonly=True)
-        if typ != "OK":
-            imap.logout()
-            return 0
+            typ, _ = imap.select("INBOX", readonly=True)
+            if typ != "OK":
+                imap.logout()
+                return 0
 
-        uidvalidity = _read_imap_uidvalidity(imap)
-        previous_uidvalidity = (mb.imap_uidvalidity or "").strip()
-        if not previous_uidvalidity:
-            # Migrate old unversioned keys once so an existing inbox is not
-            # duplicated at upgrade time. Old cached MIME paths remain usable.
-            legacy_prefix = f"imap:{mb.id}:"
-            legacy_rows = db.query(Mail).filter(
-                Mail.mailbox_id == mb.id,
-                Mail.maildir_key.like(f"{legacy_prefix}%"),
-            ).all()
-            for row in legacy_rows:
-                legacy_uid = (row.maildir_key or "")[len(legacy_prefix):]
-                if legacy_uid.isascii() and legacy_uid.isdecimal():
-                    row.maildir_key = f"{legacy_prefix}{uidvalidity}:{legacy_uid}"
-        # UIDVALIDITY changes are a new UID namespace; preserve old messages
-        # and their cached MIME data instead of reusing their identifiers.
-        mb.imap_uidvalidity = uidvalidity
+            uidvalidity = _read_imap_uidvalidity(imap)
+            previous_uidvalidity = (mb.imap_uidvalidity or "").strip()
+            if not previous_uidvalidity:
+                # Migrate old unversioned keys and cached MIME paths once so an existing
+                # inbox is not duplicated at upgrade time.
+                legacy_prefix = f"imap:{mb.id}:"
+                legacy_rows = db.query(Mail).filter(
+                    Mail.mailbox_id == mb.id,
+                    Mail.maildir_key.like(f"{legacy_prefix}%"),
+                ).all()
+                for row in legacy_rows:
+                    legacy_uid = (row.maildir_key or "")[len(legacy_prefix):]
+                    if legacy_uid.isascii() and legacy_uid.isdecimal():
+                        row.maildir_key = f"{legacy_prefix}{uidvalidity}:{legacy_uid}"
+                        legacy_cache = os.path.join(ATTACHMENT_CACHE_DIR, f"imap_{mb.id}_{legacy_uid}.eml")
+                        versioned_cache = os.path.join(ATTACHMENT_CACHE_DIR, f"imap_{mb.id}_{uidvalidity}_{legacy_uid}.eml")
+                        if os.path.isfile(legacy_cache) and not os.path.exists(versioned_cache):
+                            try:
+                                os.replace(legacy_cache, versioned_cache)
+                                if row.maildir_path == legacy_cache:
+                                    row.maildir_path = versioned_cache
+                            except OSError:
+                                pass
+            elif previous_uidvalidity != uidvalidity:
+                # Reset historical cursor cleanly inside the new UIDVALIDITY namespace.
+                mb.imap_backfill_cursor = 0
+            # UIDVALIDITY changes are a new UID namespace; preserve old messages
+            # and their cached MIME data instead of reusing their identifiers.
+            mb.imap_uidvalidity = uidvalidity
 
-        typ, search_data = imap.uid("search", None, "ALL")
-        if typ != "OK" or not search_data or not search_data[0]:
+            typ, search_data = imap.uid("search", None, "ALL")
+            if typ != "OK" or not search_data or not search_data[0]:
+                mb.sync_status = "ok"
+                mb.last_synced_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                db.commit()
+                imap.logout()
+                return 0
+
+            all_uids = search_data[0].split()
+            existing_keys = {
+                row[0]
+                for row in db.query(Mail.maildir_key).filter(Mail.mailbox_id == mb.id).all()
+                if row[0]
+            }
+
+            missing_uids: List[str] = []
+            for raw_uid in all_uids:
+                uid_str = (raw_uid.decode("utf-8", errors="ignore") if isinstance(raw_uid, bytes) else str(raw_uid)).strip()
+                if not (uid_str.isascii() and uid_str.isdecimal()):
+                    continue
+                key = f"imap:{mb.id}:{uidvalidity}:{uid_str}"
+                if key not in existing_keys:
+                    missing_uids.append(uid_str)
+
+            missing_uids.sort(key=int)
+            cap = max(1, int(max_fetch))
+            backfill_selected: List[str] = []
+            if len(missing_uids) <= cap:
+                selected_uids = list(reversed(missing_uids))
+                backfill_selected = list(missing_uids)
+            elif mode == "realtime":
+                selected_uids = list(reversed(missing_uids[-cap:]))
+            elif mode == "backfill":
+                cursor = int(mb.imap_backfill_cursor or 0)
+                after_cursor = [u for u in missing_uids if int(u) > cursor]
+                pool = after_cursor if after_cursor else missing_uids
+                selected_uids = pool[:cap]
+                backfill_selected = list(selected_uids)
+            else:
+                # Hybrid mode: prioritize newest arrivals for OTP latency while reserving
+                # a dedicated cursor-driven backfill slice so old backlog always drains.
+                backfill_quota = 0 if cap == 1 else max(1, cap // 4)
+                realtime_quota = cap - backfill_quota
+                newest_slice = list(reversed(missing_uids[-realtime_quota:]))
+                older_missing = missing_uids[:-realtime_quota]
+                cursor = int(mb.imap_backfill_cursor or 0)
+                after_cursor = [u for u in older_missing if int(u) > cursor]
+                pool = after_cursor if after_cursor else older_missing
+                backfill_slice = pool[:backfill_quota]
+                selected_uids = newest_slice + backfill_slice
+                backfill_selected = list(backfill_slice)
+
+            completed_uids: set[str] = set()
+            for uid_str in selected_uids:
+                try:
+                    typ, fetch_data = imap.uid("fetch", uid_str, "(BODY.PEEK[] FLAGS)")
+                    if typ != "OK" or not fetch_data:
+                        continue
+
+                    raw_bytes = None
+                    flags_str = ""
+                    for item in fetch_data:
+                        if isinstance(item, tuple) and len(item) >= 2:
+                            header_info = item[0].decode("utf-8", errors="ignore") if isinstance(item[0], bytes) else str(item[0])
+                            flags_str += " " + header_info
+                            if isinstance(item[1], bytes):
+                                raw_bytes = item[1]
+
+                    if not raw_bytes:
+                        completed_uids.add(uid_str)
+                        continue
+
+                    msg = email.message_from_bytes(raw_bytes, policy=policy.default)
+                    subject = str(msg.get("Subject", "(无主题)") or "(无主题)").strip()
+                    sender = str(msg.get("From", "Unknown") or "Unknown").strip()
+                    recipient = str(msg.get("To", mb.address) or mb.address).strip()
+                    msg_id = str(msg.get("Message-ID", "") or "").strip()
+                    date_str = str(msg.get("Date", "") or "").strip()
+
+                    mail_date = None
+                    if date_str:
+                        try:
+                            parsed_dt = parsedate_to_datetime(date_str)
+                            mail_date = normalize_to_utc_naive(parsed_dt)
+                        except Exception:
+                            mail_date = None
+                    if not mail_date:
+                        mail_date = datetime.now(timezone.utc).replace(tzinfo=None)
+
+                    body_text, body_html, attachments = extract_mime_bodies_and_attachments(msg)
+                    preview = build_clean_preview(body_text, body_html)
+
+                    tags = []
+                    codes = extract_verification_codes(subject, body_text)
+                    if codes:
+                        tags.append("验证码")
+                    if "invoice" in subject.lower() or "账单" in subject or "receipt" in subject.lower():
+                        tags.append("账单")
+                    if "dmarc" in subject.lower():
+                        tags.append("DMARC")
+                    if "test" in subject.lower():
+                        tags.append("测试")
+
+                    is_seen = "\\Seen" in flags_str or "\\seen" in flags_str.lower()
+
+                    cached_eml_path = f"imap://{mb.imap_host}/INBOX/{uid_str}"
+                    if attachments and raw_bytes:
+                        try:
+                            safe_uid = re.sub(r"[^A-Za-z0-9._-]", "_", uid_str)
+                            local_eml = os.path.join(ATTACHMENT_CACHE_DIR, f"imap_{mb.id}_{uidvalidity}_{safe_uid}.eml")
+                            _write_private_bytes(local_eml, raw_bytes)
+                            cached_eml_path = local_eml
+                        except Exception:
+                            pass
+
+                    mail_entry = Mail(
+                        mailbox_id=mb.id,
+                        folder="inbox",
+                        sender=sender,
+                        recipient=recipient,
+                        subject=subject,
+                        preview=preview,
+                        body_html=body_html,
+                        body_text=body_text,
+                        has_attachments=bool(attachments),
+                        attachments_json=json.dumps(attachments, ensure_ascii=False),
+                        is_read=is_seen,
+                        is_deleted=False,
+                        tags_json=json.dumps(tags, ensure_ascii=False),
+                        maildir_key=f"imap:{mb.id}:{uidvalidity}:{uid_str}",
+                        maildir_path=cached_eml_path,
+                        message_id=msg_id,
+                        created_at=mail_date
+                    )
+                    db.add(mail_entry)
+                    new_count += 1
+                    completed_uids.add(uid_str)
+                except Exception as inner_e:
+                    print(f"IMAP fetch UID {uid_str} notice ({mb.address}): {inner_e}")
+
+            backfill_completed = [int(u) for u in backfill_selected if u in completed_uids]
+            if backfill_completed:
+                if len(missing_uids) <= cap and len(completed_uids) == len(missing_uids):
+                    mb.imap_backfill_cursor = max(int(mb.imap_backfill_cursor or 0), max(backfill_completed))
+                else:
+                    mb.imap_backfill_cursor = max(backfill_completed)
+
             mb.sync_status = "ok"
             mb.last_synced_at = datetime.now(timezone.utc).replace(tzinfo=None)
             db.commit()
-            imap.logout()
-            return 0
-
-        all_uids = search_data[0].split()
-        # Scan the complete UID list; cap fetches rather than discovery so
-        # messages beyond the newest 40 eventually get imported.
-        recent_uids = all_uids
-
-        existing_keys = {
-            row[0]
-            for row in db.query(Mail.maildir_key).filter(Mail.mailbox_id == mb.id).all()
-            if row[0]
-        }
-
-        missing_uids = []
-        for raw_uid in recent_uids:
-            uid_str = (raw_uid.decode("utf-8", errors="ignore") if isinstance(raw_uid, bytes) else str(raw_uid)).strip()
-            if not uid_str.isdigit():
-                continue
-            key = f"imap:{mb.id}:{uidvalidity}:{uid_str}"
-            if key not in existing_keys:
-                missing_uids.append(uid_str)
-
-        # Oldest missing first prevents high-volume inboxes starving the backlog.
-        missing_uids = missing_uids[:max(1, max_fetch)]
-        for uid_str in missing_uids:
+            _ext_mb_last_sync_ts[mb.id] = time.time()
             try:
-                typ, fetch_data = imap.uid("fetch", uid_str, "(BODY.PEEK[] FLAGS)")
-                if typ != "OK" or not fetch_data:
-                    continue
-
-                raw_bytes = None
-                flags_str = ""
-                for item in fetch_data:
-                    if isinstance(item, tuple) and len(item) >= 2:
-                        header_info = item[0].decode("utf-8", errors="ignore") if isinstance(item[0], bytes) else str(item[0])
-                        flags_str += " " + header_info
-                        if isinstance(item[1], bytes):
-                            raw_bytes = item[1]
-
-                if not raw_bytes:
-                    continue
-
-                msg = email.message_from_bytes(raw_bytes, policy=policy.default)
-                subject = str(msg.get("Subject", "(无主题)") or "(无主题)").strip()
-                sender = str(msg.get("From", "Unknown") or "Unknown").strip()
-                recipient = str(msg.get("To", mb.address) or mb.address).strip()
-                msg_id = str(msg.get("Message-ID", "") or "").strip()
-                date_str = str(msg.get("Date", "") or "").strip()
-
-                mail_date = None
-                if date_str:
-                    try:
-                        parsed_dt = parsedate_to_datetime(date_str)
-                        mail_date = normalize_to_utc_naive(parsed_dt)
-                    except Exception:
-                        mail_date = None
-                if not mail_date:
-                    mail_date = datetime.now(timezone.utc).replace(tzinfo=None)
-
-                body_text, body_html, attachments = extract_mime_bodies_and_attachments(msg)
-                preview = build_clean_preview(body_text, body_html)
-
-                tags = []
-                codes = extract_verification_codes(subject, body_text)
-                if codes:
-                    tags.append("验证码")
-                if "invoice" in subject.lower() or "账单" in subject or "receipt" in subject.lower():
-                    tags.append("账单")
-                if "dmarc" in subject.lower():
-                    tags.append("DMARC")
-                if "test" in subject.lower():
-                    tags.append("测试")
-
-                is_seen = "\\Seen" in flags_str or "\\seen" in flags_str.lower()
-
-                cached_eml_path = f"imap://{mb.imap_host}/INBOX/{uid_str}"
-                if attachments and raw_bytes:
-                    try:
-                        safe_uid = re.sub(r"[^A-Za-z0-9._-]", "_", uid_str)
-                        local_eml = os.path.join(ATTACHMENT_CACHE_DIR, f"imap_{mb.id}_{uidvalidity}_{safe_uid}.eml")
-                        _write_private_bytes(local_eml, raw_bytes)
-                        cached_eml_path = local_eml
-                    except Exception:
-                        pass
-
-                mail_entry = Mail(
-                    mailbox_id=mb.id,
-                    folder="inbox",
-                    sender=sender,
-                    recipient=recipient,
-                    subject=subject,
-                    preview=preview,
-                    body_html=body_html,
-                    body_text=body_text,
-                    has_attachments=bool(attachments),
-                    attachments_json=json.dumps(attachments, ensure_ascii=False),
-                    is_read=is_seen,
-                    is_deleted=False,
-                    tags_json=json.dumps(tags, ensure_ascii=False),
-                    maildir_key=f"imap:{mb.id}:{uidvalidity}:{uid_str}",
-                    maildir_path=cached_eml_path,
-                    message_id=msg_id,
-                    created_at=mail_date
-                )
-                db.add(mail_entry)
-                new_count += 1
-            except Exception as inner_e:
-                print(f"IMAP fetch UID {uid_str} notice ({mb.address}): {inner_e}")
-
-        mb.sync_status = "ok"
-        mb.last_synced_at = datetime.now(timezone.utc).replace(tzinfo=None)
-        db.commit()
-        try:
-            imap.logout()
-        except Exception:
-            pass
-    except Exception as e:
-        mb.sync_status = f"error: {str(e)[:80]}"
-        db.commit()
-        print(f"External IMAP sync error ({mb.address}): {e}")
+                imap.logout()
+            except Exception:
+                pass
+        except Exception as e:
+            mb.sync_status = f"error: {str(e)[:80]}"
+            db.commit()
+            print(f"External IMAP sync error ({mb.address}): {e}")
 
     return new_count
+
+
+def backfill_single_external_mailbox(db: Session, mb: Mailbox, max_fetch: int = 40) -> int:
+    """Advance historical IMAP backfill for a single external mailbox using its cursor."""
+    return sync_single_external_mailbox(db, mb, max_fetch=max_fetch, mode="backfill")
+
 
 def sync_all_external_mailboxes(force: bool = False) -> int:
     global _last_ext_sync_ts
@@ -1523,16 +1676,93 @@ def sync_all_external_mailboxes(force: bool = False) -> int:
         with SessionLocal() as ext_db:
             ext_mbs = ext_db.query(Mailbox).filter(Mailbox.is_external == True).all()
             for mb in ext_mbs:
-                total_new += sync_single_external_mailbox(ext_db, mb, max_fetch=40)
+                total_new += sync_single_external_mailbox(ext_db, mb, max_fetch=40, mode="hybrid")
     finally:
         _ext_sync_lock.release()
     return total_new
+
+
+def backfill_all_external_mailboxes(max_fetch: int = 30) -> int:
+    """Background historical backfill pass across external mailboxes."""
+    total_new = 0
+    with SessionLocal() as ext_db:
+        ext_mbs = ext_db.query(Mailbox).filter(Mailbox.is_external == True).all()
+        for mb in ext_mbs:
+            total_new += backfill_single_external_mailbox(ext_db, mb, max_fetch=max_fetch)
+    return total_new
+
+
+def sync_target_external_mailboxes_for_agent(
+    db: Session,
+    mailbox_id: Optional[int] = None,
+    address: Optional[str] = None,
+    domain: Optional[str] = None,
+    allowed_addresses: Optional[List[str]] = None,
+    min_interval_sec: float = EXT_TARGETED_SYNC_MIN_INTERVAL_SEC,
+) -> int:
+    """Sync only explicitly targeted external mailbox(es) with per-mailbox rate limiting."""
+    q = db.query(Mailbox).filter(Mailbox.is_external == True)
+    has_narrow_target = False
+    if mailbox_id:
+        q = q.filter(Mailbox.id == mailbox_id)
+        has_narrow_target = True
+    elif address:
+        addr = address.strip().lower()
+        if "@" in addr:
+            q = q.filter(Mailbox.address == addr)
+        else:
+            q = q.filter(Mailbox.prefix == addr)
+        has_narrow_target = True
+    elif domain:
+        dom = domain.strip().lower()
+        q = q.join(Domain).filter(Domain.name == dom)
+        has_narrow_target = True
+    elif allowed_addresses and len(allowed_addresses) <= 3:
+        q = q.filter(Mailbox.address.in_(allowed_addresses))
+        has_narrow_target = True
+
+    if not has_narrow_target:
+        if (time.time() - _last_ext_sync_ts) >= 15.0:
+            threading.Thread(
+                target=sync_all_external_mailboxes,
+                kwargs={"force": False},
+                daemon=True,
+            ).start()
+        return 0
+
+    if allowed_addresses:
+        q = q.filter(Mailbox.address.in_(allowed_addresses))
+
+    targets = q.all()
+    if not targets:
+        return 0
+
+    synced_total = 0
+    now_ts = time.time()
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    for mb in targets:
+        recent_in_proc = (
+            mb.id in _ext_mb_last_sync_ts
+            and (now_ts - _ext_mb_last_sync_ts[mb.id]) < min_interval_sec
+        )
+        recent_in_db = (
+            mb.last_synced_at is not None
+            and (now_utc - mb.last_synced_at).total_seconds() < min_interval_sec
+        )
+        if recent_in_proc or recent_in_db:
+            continue
+        if _get_ext_mailbox_lock(mb.id).locked():
+            continue
+        synced_total += sync_single_external_mailbox(db, mb, max_fetch=20, mode="realtime")
+    return synced_total
+
 
 def _external_imap_daemon_loop():
     while True:
         time.sleep(45)
         try:
             sync_all_external_mailboxes(force=False)
+            backfill_all_external_mailboxes(max_fetch=30)
         except Exception as e:
             print("External IMAP daemon notice:", e)
 
@@ -3236,7 +3466,7 @@ def delete_mail(mail_id: int, permanent: bool = False, db: Session = Depends(get
 # ==============================================================================
 def serialize_agent_mail(m: Mail, include_body: bool = True, include_html: bool = False) -> Dict[str, Any]:
     codes = extract_verification_codes(m.subject, m.body_text)
-    links = extract_links(m.body_text, m.body_html)
+    links = prioritize_agent_links(m.subject, m.body_text, m.body_html)
     data: Dict[str, Any] = {
         "id": m.id,
         "mailbox_id": m.mailbox_id,
@@ -3312,8 +3542,8 @@ def get_agent_api_spec():
             {
                 "method": "GET",
                 "path": "/api/agent/code",
-                "description": "专门用于快速提取最新验证码/OTP与激活链接的极简接口",
-                "params": ["address", "sender", "unread_only", "within_minutes", "mark_read"]
+                "description": "快速提取近期（默认 30 分钟内）最新验证码/OTP 或验证链接（Magic Link）的极简接口",
+                "params": ["address", "sender", "subject", "unread_only", "within_minutes", "mark_read"]
             },
             {
                 "method": "GET",
@@ -3406,8 +3636,15 @@ def agent_list_mails(
     """Query emails for AI Agents (Hermes) with clean plain text and extracted codes/links."""
     pol = _check_agent_policy(request, is_send=mark_read and _is_csrf_safe_get_mutation(request))
     allow_get_mutation = _is_csrf_safe_get_mutation(request)
-    # Avoid opening every remote IMAP connection for each Agent read.
-    sync_maildir_to_db(db, force=False)
+    # Local Maildir scan runs unthrottled without blocking on unrelated remote IMAP accounts.
+    sync_maildir_to_db(db, force=True, sync_external=False)
+    sync_target_external_mailboxes_for_agent(
+        db,
+        mailbox_id=mailbox_id,
+        address=address,
+        domain=domain,
+        allowed_addresses=pol.get("allowed_addresses") if pol else None,
+    )
     q = db.query(Mail).filter(Mail.is_deleted == False)
 
     if folder != "all":
@@ -3471,14 +3708,19 @@ def agent_get_latest_mail_or_code(
     sender: Optional[str] = Query(None, description="发件人过滤，如 openai 或 noreply"),
     subject: Optional[str] = Query(None, description="主题过滤"),
     unread_only: bool = Query(False, description="是否仅限未读邮件"),
-    within_minutes: Optional[int] = Query(None, description="仅查找最近 N 分钟内的邮件"),
+    within_minutes: Optional[int] = Query(None, ge=0, description="仅查找最近 N 分钟内的邮件（/api/agent/code 默认 30 分钟，传 0 不限制）"),
     mark_read: bool = Query(False, description="获取后是否标记为已读"),
     db: Session = Depends(get_db)
 ):
-    """Fetch the single newest matching email with extracted verification code and links."""
+    """Fetch the single newest matching email, or newest recent OTP/magic-link candidate for /api/agent/code."""
     pol = _check_agent_policy(request, is_send=mark_read and _is_csrf_safe_get_mutation(request))
     allow_get_mutation = _is_csrf_safe_get_mutation(request)
-    sync_maildir_to_db(db, force=False)
+    sync_maildir_to_db(db, force=True, sync_external=False)
+    sync_target_external_mailboxes_for_agent(
+        db,
+        address=address,
+        allowed_addresses=pol.get("allowed_addresses") if pol else None,
+    )
     q = db.query(Mail).filter(Mail.is_deleted == False, Mail.folder == "inbox")
 
     if address:
@@ -3497,24 +3739,31 @@ def agent_get_latest_mail_or_code(
         q = q.filter(Mail.subject.ilike(f"%{_escape_like(subject.strip())}%", escape="\\"))
     if unread_only:
         q = q.filter(Mail.is_read == False)
-    if within_minutes is not None and within_minutes > 0:
-        cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=within_minutes)
-        q = q.filter(Mail.created_at >= cutoff)
 
     is_code_endpoint = request.url.path.rstrip("/") == "/api/agent/code"
+    effective_window = DEFAULT_AGENT_CODE_WINDOW_MINUTES if (within_minutes is None and is_code_endpoint) else within_minutes
+    if effective_window is not None and effective_window > 0:
+        cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=effective_window)
+        q = q.filter(Mail.created_at >= cutoff)
+
     if is_code_endpoint:
-        # Codes may be older than ten newer newsletters. Never claim that an
-        # unrelated non-code email contains a verification code.
+        # Inspect recent candidates newest-first and accept either numeric OTPs or
+        # credible verification/magic links so newer Magic Links win over older OTPs
+        # while plain newsletters are skipped.
         m = None
-        for cand in q.order_by(Mail.created_at.desc(), Mail.id.desc()).yield_per(100):
-            if extract_verification_codes(cand.subject, cand.body_text):
+        candidates = q.order_by(Mail.created_at.desc(), Mail.id.desc()).limit(MAX_AGENT_CODE_SCAN).all()
+        for cand in candidates:
+            if (
+                extract_verification_codes(cand.subject, cand.body_text)
+                or extract_verification_links(cand.subject, cand.body_text, cand.body_html)
+            ):
                 m = cand
                 break
     else:
         m = q.order_by(Mail.created_at.desc(), Mail.id.desc()).first()
 
     if not m:
-        return {"found": False, "mail": None, "verification_code": None, "links": []}
+        return {"found": False, "mail": None, "verification_code": None, "verification_codes": [], "links": []}
 
     data = serialize_agent_mail(m, include_body=True, include_html=False)
     if mark_read and allow_get_mutation and not m.is_read:
@@ -3538,7 +3787,7 @@ def agent_get_mail_detail(
     db: Session = Depends(get_db)
 ):
     """Read full email content and extracted metadata for an external AI Agent."""
-    sync_maildir_to_db(db)
+    sync_maildir_to_db(db, force=True, sync_external=False)
     m = db.query(Mail).filter(Mail.id == mail_id, Mail.is_deleted == False).first()
     if not m:
         raise HTTPException(status_code=404, detail="Mail not found")
@@ -3748,7 +3997,7 @@ def agent_reply_mail(payload: AgentReplyMailPayload, request: Request, db: Sessi
 def agent_list_mailboxes(request: Request, db: Session = Depends(get_db)):
     """List all mailboxes and their unread counts for AI Agents."""
     pol = _check_agent_policy(request)
-    sync_maildir_to_db(db)
+    sync_maildir_to_db(db, force=True, sync_external=False)
     q = db.query(Mailbox)
     if pol and pol.get("allowed_addresses"):
         q = q.filter(Mailbox.address.in_(pol["allowed_addresses"]))

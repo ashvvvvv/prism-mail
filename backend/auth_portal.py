@@ -4,7 +4,6 @@ import hashlib
 import hmac
 import sqlite3
 import json
-from contextlib import contextmanager
 import os
 import secrets
 import threading
@@ -48,6 +47,12 @@ MAX_TRACKED_IPS = 4096
 # Durable session revocation is shared across workers and survives restarts.
 # Persist PRISM_DATA_DIR across deploys; do not place this file in ephemeral storage.
 _REVOKED_SESSIONS_DB = os.path.join(DATA_DIR, ".revoked_sessions.sqlite3")
+_REVOCATION_INIT_LOCK = threading.Lock()
+_INITIALIZED_REVOCATION_DBS: set[str] = set()
+
+
+class RevocationStoreUnavailableError(RuntimeError):
+    """Raised when the persistent session revocation SQLite store is unavailable."""
 
 PUBLIC_EXACT_PATHS = {
     "/login",
@@ -178,50 +183,83 @@ def _clear_auth_attempts(bucket_key: str) -> None:
         _FAILED_LOGINS.pop(bucket_key, None)
 
 
-@contextmanager
-def _revocations_conn():
-    """Share revoked tokens via an on-disk SQLite table, closing each connection."""
-    conn = sqlite3.connect(_REVOKED_SESSIONS_DB, timeout=5)
-    try:
-        conn.execute("CREATE TABLE IF NOT EXISTS revoked (sig TEXT PRIMARY KEY, expires INTEGER NOT NULL)")
+def _ensure_revocations_db_ready(db_path: str) -> None:
+    """Initialize WAL mode, table schema and restrictive file mode once per DB path."""
+    abs_path = os.path.abspath(db_path)
+    if abs_path in _INITIALIZED_REVOCATION_DBS and os.path.isfile(abs_path):
+        return
+    with _REVOCATION_INIT_LOCK:
+        if abs_path in _INITIALIZED_REVOCATION_DBS and os.path.isfile(abs_path):
+            return
+        os.makedirs(os.path.dirname(abs_path) or ".", exist_ok=True)
+        conn = sqlite3.connect(abs_path, timeout=5.0)
+        try:
+            conn.execute("PRAGMA busy_timeout = 5000")
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA synchronous = NORMAL")
+            conn.execute("CREATE TABLE IF NOT EXISTS revoked (sig TEXT PRIMARY KEY, expires INTEGER NOT NULL)")
+            conn.execute("CREATE INDEX IF NOT EXISTS ix_revoked_expires ON revoked (expires)")
+            conn.commit()
+        finally:
+            conn.close()
         if os.name != "nt":
-            os.chmod(_REVOKED_SESSIONS_DB, 0o600)
-        with conn:
-            yield conn
-    finally:
-        conn.close()
+            for suffix in ("", "-wal", "-shm"):
+                p = abs_path + suffix
+                if os.path.exists(p):
+                    try:
+                        os.chmod(p, 0o600)
+                    except OSError:
+                        pass
+        _INITIALIZED_REVOCATION_DBS.add(abs_path)
 
 
 def _revoke_session_token(token: Optional[str]) -> None:
     if not token or "." not in token:
         return
     b64, sig = token.split(".", 1)
-    if not sig:
+    if not b64 or len(b64) > 4096 or len(sig) != 64 or not all(c in "0123456789abcdefABCDEF" for c in sig):
         return
     try:
         raw = base64.urlsafe_b64decode(b64 + "=" * (-len(b64) % 4))
         expires = int(json.loads(raw.decode("utf-8")).get("exp", 0))
     except (ValueError, TypeError, UnicodeError):
         return
-    if expires < int(time.time()):
+    now_ts = int(time.time())
+    if expires < now_ts:
         return
-    with _revocations_conn() as conn:
-        conn.execute("INSERT OR REPLACE INTO revoked(sig, expires) VALUES (?, ?)", (sig, expires))
-        conn.execute("DELETE FROM revoked WHERE expires < ?", (int(time.time()),))
+    db_path = os.path.abspath(_REVOKED_SESSIONS_DB)
+    try:
+        _ensure_revocations_db_ready(db_path)
+        conn = sqlite3.connect(db_path, timeout=5.0)
+        try:
+            conn.execute("PRAGMA busy_timeout = 5000")
+            with conn:
+                conn.execute("INSERT OR REPLACE INTO revoked(sig, expires) VALUES (?, ?)", (sig, expires))
+                conn.execute("DELETE FROM revoked WHERE expires < ?", (now_ts,))
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError) as exc:
+        raise RevocationStoreUnavailableError("Session revocation database unavailable") from exc
 
 
 def _is_session_sig_revoked(sig: str) -> bool:
-    if not sig:
+    if not sig or len(sig) > 128:
         return False
+    db_path = os.path.abspath(_REVOKED_SESSIONS_DB)
     try:
-        with _revocations_conn() as conn:
-            return conn.execute(
-                "SELECT 1 FROM revoked WHERE sig = ? AND expires >= ?",
+        _ensure_revocations_db_ready(db_path)
+        conn = sqlite3.connect(db_path, timeout=5.0)
+        try:
+            conn.execute("PRAGMA busy_timeout = 5000")
+            row = conn.execute(
+                "SELECT 1 FROM revoked WHERE sig = ? AND expires >= ? LIMIT 1",
                 (sig, int(time.time())),
-            ).fetchone() is not None
-    except sqlite3.Error:
-        # Fail closed rather than accepting revoked cookies if the DB is broken.
-        return True
+            ).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError) as exc:
+        raise RevocationStoreUnavailableError("Session revocation database unavailable") from exc
 
 
 def generate_api_key() -> str:
@@ -339,6 +377,8 @@ def verify_session_token(token: Optional[str], user: User) -> bool:
         if int(data.get("uid", -1)) != user.id:
             return False
         return True
+    except RevocationStoreUnavailableError:
+        raise
     except Exception:
         return False
 
@@ -855,7 +895,16 @@ def register_auth_middleware_and_routes(app: FastAPI) -> None:
                     )
             return await _finish(await call_next(request))
 
-        authed, auth_type = check_request_auth(request)
+        try:
+            authed, auth_type = check_request_auth(request)
+        except RevocationStoreUnavailableError:
+            return await _finish(
+                JSONResponse(
+                    status_code=503,
+                    content={"detail": "会话状态存储暂时不可用，请稍后重试"},
+                    headers={"Retry-After": "3"},
+                )
+            )
         if authed:
             request.state.auth_type = auth_type
             if auth_type == "api_key" and not _is_api_key_path_allowed(path, request.method):
@@ -910,7 +959,14 @@ def register_auth_middleware_and_routes(app: FastAPI) -> None:
 
     @app.get("/login", include_in_schema=False)
     def login_page(request: Request, next: Optional[str] = None):
-        authed, _ = check_request_auth(request)
+        try:
+            authed, _ = check_request_auth(request)
+        except RevocationStoreUnavailableError:
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "会话状态存储暂时不可用，请稍后重试"},
+                headers={"Retry-After": "3"},
+            )
         edition, variants = get_active_ui_prefs()
         target = safe_next_url(next, fallback=f"/{edition}/")
         if authed:
@@ -980,7 +1036,14 @@ def register_auth_middleware_and_routes(app: FastAPI) -> None:
     def api_logout(request: Request):
         cookie_val = request.cookies.get(COOKIE_NAME)
         if cookie_val:
-            _revoke_session_token(cookie_val)
+            try:
+                _revoke_session_token(cookie_val)
+            except RevocationStoreUnavailableError:
+                return JSONResponse(
+                    status_code=503,
+                    content={"detail": "会话状态存储暂时不可用，请稍后重试"},
+                    headers={"Retry-After": "3"},
+                )
         resp = JSONResponse({"status": "logged_out"})
         resp.delete_cookie(
             key=COOKIE_NAME,

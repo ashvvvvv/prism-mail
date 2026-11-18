@@ -11,7 +11,9 @@ PrismMail 专为外部 AI Agent Harness（如 **Hermes**、MCP Server、自动�
 
 ## 1. 一键获取最新验证码 / 最新邮件 (`GET /api/agent/code` 或 `/api/agent/mails/latest`)
 
-适用于注册/登录流程中等待验证码或验证链接：
+适用于注册/登录流程中等待验证码或验证链接（Magic Link）：
+- `GET /api/agent/code`：默认检索最近 `30` 分钟内的邮件（可通过 `within_minutes` 调整，传 `0` 则不限时间），优先返回最新包含数字验证码 **或** 可信验证/登录链接的邮件，并自动跳过普通通知邮件。
+- `GET /api/agent/mails/latest`：始终返回符合过滤条件（可选 `within_minutes`）的最新一封匹配邮件。
 
 ```bash
 # 获取指定邮箱最新的一封邮件及提取出的验证码/链接
