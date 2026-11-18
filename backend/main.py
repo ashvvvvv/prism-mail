@@ -529,17 +529,29 @@ def _safe_vmail_path(*parts: str) -> str:
 
 
 def _atomic_write_text(path: str, content: str, mode: int = 0o644) -> None:
-    parent = os.path.dirname(os.path.abspath(path))
+    abs_path = os.path.abspath(path)
+    parent = os.path.dirname(abs_path)
     os.makedirs(parent, exist_ok=True)
+    prev_stat = None
+    try:
+        if os.path.exists(abs_path):
+            prev_stat = os.stat(abs_path)
+    except Exception:
+        prev_stat = None
     fd, tmp_path = tempfile.mkstemp(dir=parent, prefix=".tmp_prism_")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(content)
+        if prev_stat is not None and hasattr(os, "chown"):
+            try:
+                os.chown(tmp_path, prev_stat.st_uid, prev_stat.st_gid)
+            except Exception:
+                pass
         try:
-            os.chmod(tmp_path, mode)
+            os.chmod(tmp_path, mode if prev_stat is None else (prev_stat.st_mode & 0o777) or mode)
         except Exception:
             pass
-        os.replace(tmp_path, path)
+        os.replace(tmp_path, abs_path)
     except Exception:
         try:
             os.remove(tmp_path)
