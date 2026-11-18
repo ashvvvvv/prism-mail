@@ -207,6 +207,7 @@ class Mailbox(Base):
     smtp_port = Column(Integer, default=465)
     auth_password = Column(Text, default="")
     sync_status = Column(String(100), default="ok")
+    imap_uidvalidity = Column(String(50), default="")
     last_synced_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
@@ -320,6 +321,7 @@ def init_db():
             "ALTER TABLE mailboxes ADD COLUMN smtp_port INTEGER DEFAULT 465",
             "ALTER TABLE mailboxes ADD COLUMN auth_password VARCHAR(255) DEFAULT ''",
             "ALTER TABLE mailboxes ADD COLUMN sync_status VARCHAR(100) DEFAULT 'ok'",
+            "ALTER TABLE mailboxes ADD COLUMN imap_uidvalidity VARCHAR(50) DEFAULT ''",
             "ALTER TABLE mailboxes ADD COLUMN last_synced_at DATETIME",
             "ALTER TABLE mails ADD COLUMN is_deleted BOOLEAN DEFAULT 0",
             "ALTER TABLE mails ADD COLUMN maildir_key VARCHAR(255)",

@@ -954,14 +954,21 @@ def sync_maildir_to_db(db: Session, force: bool = False):
                         preview = build_clean_preview(body_text, body_html)
 
                         # 2) Check if this matches a legacy DB row that didn't have maildir_key yet
+                        # Sender and subject alone cannot identify an email:
+                        # two distinct messages may share both values.
                         legacy_candidates = db.query(Mail).filter(
                             Mail.mailbox_id == mb.id,
-                            Mail.maildir_key.is_(None)
-                        ).all()
+                            Mail.maildir_key.is_(None),
+                            Mail.folder == folder_type,
+                            Mail.message_id == msg_id,
+                        ).all() if msg_id else []
                         legacy_row = next(
                             (
                                 r for r in legacy_candidates
-                                if (r.subject or "").strip() == subject and (r.sender or "").strip() == sender
+                                if (r.subject or "").strip() == subject
+                                and (r.sender or "").strip() == sender
+                                and (r.recipient or "").strip() == recipient
+                                and (r.body_text or "") == body_text
                             ),
                             None
                         )
@@ -1322,6 +1329,18 @@ def test_external_mailbox_connection(
 _ext_sync_lock = threading.Lock()
 _last_ext_sync_ts: float = 0.0
 
+
+def _read_imap_uidvalidity(imap) -> str:
+    """Retrieve the INBOX UIDVALIDITY; refuse an ambiguous UID namespace."""
+    typ, values = imap.response("UIDVALIDITY")
+    value = values[0] if values else None
+    raw = value.decode("ascii", errors="ignore") if isinstance(value, bytes) else str(value or "")
+    uidvalidity = raw.strip()
+    if typ is None or not uidvalidity.isascii() or not uidvalidity.isdecimal() or int(uidvalidity) < 1:
+        raise RuntimeError("IMAP server did not provide a valid UIDVALIDITY")
+    return uidvalidity
+
+
 def sync_single_external_mailbox(db: Session, mb: Mailbox, max_fetch: int = 40) -> int:
     """Pull latest messages via IMAP for a single external mailbox."""
     ext_pwd = mb.get_auth_password()
@@ -1344,6 +1363,24 @@ def sync_single_external_mailbox(db: Session, mb: Mailbox, max_fetch: int = 40) 
             imap.logout()
             return 0
 
+        uidvalidity = _read_imap_uidvalidity(imap)
+        previous_uidvalidity = (mb.imap_uidvalidity or "").strip()
+        if not previous_uidvalidity:
+            # Migrate old unversioned keys once so an existing inbox is not
+            # duplicated at upgrade time. Old cached MIME paths remain usable.
+            legacy_prefix = f"imap:{mb.id}:"
+            legacy_rows = db.query(Mail).filter(
+                Mail.mailbox_id == mb.id,
+                Mail.maildir_key.like(f"{legacy_prefix}%"),
+            ).all()
+            for row in legacy_rows:
+                legacy_uid = (row.maildir_key or "")[len(legacy_prefix):]
+                if legacy_uid.isascii() and legacy_uid.isdecimal():
+                    row.maildir_key = f"{legacy_prefix}{uidvalidity}:{legacy_uid}"
+        # UIDVALIDITY changes are a new UID namespace; preserve old messages
+        # and their cached MIME data instead of reusing their identifiers.
+        mb.imap_uidvalidity = uidvalidity
+
         typ, search_data = imap.uid("search", None, "ALL")
         if typ != "OK" or not search_data or not search_data[0]:
             mb.sync_status = "ok"
@@ -1353,7 +1390,9 @@ def sync_single_external_mailbox(db: Session, mb: Mailbox, max_fetch: int = 40) 
             return 0
 
         all_uids = search_data[0].split()
-        recent_uids = all_uids[-max_fetch:]
+        # Scan the complete UID list; cap fetches rather than discovery so
+        # messages beyond the newest 40 eventually get imported.
+        recent_uids = all_uids
 
         existing_keys = {
             row[0]
@@ -1366,10 +1405,12 @@ def sync_single_external_mailbox(db: Session, mb: Mailbox, max_fetch: int = 40) 
             uid_str = (raw_uid.decode("utf-8", errors="ignore") if isinstance(raw_uid, bytes) else str(raw_uid)).strip()
             if not uid_str.isdigit():
                 continue
-            key = f"imap:{mb.id}:{uid_str}"
+            key = f"imap:{mb.id}:{uidvalidity}:{uid_str}"
             if key not in existing_keys:
                 missing_uids.append(uid_str)
 
+        # Oldest missing first prevents high-volume inboxes starving the backlog.
+        missing_uids = missing_uids[:max(1, max_fetch)]
         for uid_str in missing_uids:
             try:
                 typ, fetch_data = imap.uid("fetch", uid_str, "(BODY.PEEK[] FLAGS)")
@@ -1425,7 +1466,7 @@ def sync_single_external_mailbox(db: Session, mb: Mailbox, max_fetch: int = 40) 
                 if attachments and raw_bytes:
                     try:
                         safe_uid = re.sub(r"[^A-Za-z0-9._-]", "_", uid_str)
-                        local_eml = os.path.join(ATTACHMENT_CACHE_DIR, f"imap_{mb.id}_{safe_uid}.eml")
+                        local_eml = os.path.join(ATTACHMENT_CACHE_DIR, f"imap_{mb.id}_{uidvalidity}_{safe_uid}.eml")
                         _write_private_bytes(local_eml, raw_bytes)
                         cached_eml_path = local_eml
                     except Exception:
@@ -1445,7 +1486,7 @@ def sync_single_external_mailbox(db: Session, mb: Mailbox, max_fetch: int = 40) 
                     is_read=is_seen,
                     is_deleted=False,
                     tags_json=json.dumps(tags, ensure_ascii=False),
-                    maildir_key=f"imap:{mb.id}:{uid_str}",
+                    maildir_key=f"imap:{mb.id}:{uidvalidity}:{uid_str}",
                     maildir_path=cached_eml_path,
                     message_id=msg_id,
                     created_at=mail_date
@@ -2790,13 +2831,23 @@ def load_raw_mime_message(db: Session, m: Mail):
 
     # 4. External IMAP fallback (check local IMAP cache first, otherwise fetch via UID PEEK and cache)
     if mb and mb.is_external and m.maildir_key and m.maildir_key.startswith("imap:"):
-        parts = m.maildir_key.split(":", 2)
-        if len(parts) == 3:
-            uid_str = parts[2].strip()
-            if not uid_str.isdigit():
+        parts = m.maildir_key.split(":")
+        if len(parts) in (3, 4) and parts[1] == str(mb.id):
+            uid_str = parts[-1].strip()
+            validity = parts[2].strip() if len(parts) == 4 else ""
+            if not uid_str.isascii() or not uid_str.isdecimal():
+                return None
+            if validity and (not validity.isascii() or not validity.isdecimal()):
+                return None
+            # Versioned messages can only be fetched in their original UID
+            # namespace. Locally cached original MIME was checked above.
+            if validity and validity != (mb.imap_uidvalidity or ""):
+                return None
+            if not validity and mb.imap_uidvalidity:
                 return None
             safe_uid = uid_str
-            imap_cache = os.path.join(ATTACHMENT_CACHE_DIR, f"imap_{mb.id}_{safe_uid}.eml")
+            suffix = f"{validity}_{safe_uid}" if validity else safe_uid
+            imap_cache = os.path.join(ATTACHMENT_CACHE_DIR, f"imap_{mb.id}_{suffix}.eml")
             if os.path.isfile(imap_cache):
                 with open(imap_cache, "rb") as f:
                     return email.message_from_binary_file(f, policy=policy.default)
@@ -2815,6 +2866,12 @@ def load_raw_mime_message(db: Session, m: Mail):
                     typ, _ = imap.select("INBOX", readonly=True)
                     raw_bytes = None
                     if typ == "OK":
+                        # Do not fetch the same numeric UID from a reset mailbox.
+                        live_uidvalidity = _read_imap_uidvalidity(imap)
+                        if validity and live_uidvalidity != validity:
+                            return None
+                        if not validity and mb.imap_uidvalidity:
+                            return None
                         typ_f, fetch_data = imap.uid("fetch", uid_str, "(BODY.PEEK[])")
                         if typ_f == "OK" and fetch_data:
                             for item in fetch_data:
@@ -3347,9 +3404,10 @@ def agent_list_mails(
     db: Session = Depends(get_db)
 ):
     """Query emails for AI Agents (Hermes) with clean plain text and extracted codes/links."""
-    pol = _check_agent_policy(request)
+    pol = _check_agent_policy(request, is_send=mark_read and _is_csrf_safe_get_mutation(request))
     allow_get_mutation = _is_csrf_safe_get_mutation(request)
-    sync_maildir_to_db(db, force=allow_get_mutation)
+    # Avoid opening every remote IMAP connection for each Agent read.
+    sync_maildir_to_db(db, force=False)
     q = db.query(Mail).filter(Mail.is_deleted == False)
 
     if folder != "all":
@@ -3418,9 +3476,9 @@ def agent_get_latest_mail_or_code(
     db: Session = Depends(get_db)
 ):
     """Fetch the single newest matching email with extracted verification code and links."""
-    pol = _check_agent_policy(request)
+    pol = _check_agent_policy(request, is_send=mark_read and _is_csrf_safe_get_mutation(request))
     allow_get_mutation = _is_csrf_safe_get_mutation(request)
-    sync_maildir_to_db(db, force=allow_get_mutation)
+    sync_maildir_to_db(db, force=False)
     q = db.query(Mail).filter(Mail.is_deleted == False, Mail.folder == "inbox")
 
     if address:
@@ -3445,14 +3503,13 @@ def agent_get_latest_mail_or_code(
 
     is_code_endpoint = request.url.path.rstrip("/") == "/api/agent/code"
     if is_code_endpoint:
-        candidates = q.order_by(Mail.created_at.desc(), Mail.id.desc()).limit(10).all()
+        # Codes may be older than ten newer newsletters. Never claim that an
+        # unrelated non-code email contains a verification code.
         m = None
-        for cand in candidates:
+        for cand in q.order_by(Mail.created_at.desc(), Mail.id.desc()).yield_per(100):
             if extract_verification_codes(cand.subject, cand.body_text):
                 m = cand
                 break
-        if m is None and candidates:
-            m = candidates[0]
     else:
         m = q.order_by(Mail.created_at.desc(), Mail.id.desc()).first()
 
@@ -3485,7 +3542,10 @@ def agent_get_mail_detail(
     m = db.query(Mail).filter(Mail.id == mail_id, Mail.is_deleted == False).first()
     if not m:
         raise HTTPException(status_code=404, detail="Mail not found")
-    _check_agent_policy(request, target_address=m.mailbox.address if m.mailbox else "")
+    _check_agent_policy(
+        request, target_address=m.mailbox.address if m.mailbox else "",
+        is_send=mark_read and _is_csrf_safe_get_mutation(request),
+    )
 
     if mark_read and _is_csrf_safe_get_mutation(request) and not m.is_read:
         m.is_read = True
@@ -3515,7 +3575,11 @@ def agent_read_or_write_mail_summary(
     m = db.query(Mail).filter(Mail.id == mail_id, Mail.is_deleted == False).first()
     if not m:
         raise HTTPException(status_code=404, detail="Mail not found")
-    _check_agent_policy(request, target_address=m.mailbox.address if m.mailbox else "")
+    # Even an empty JSON object may update existing ai_summary.updated_at.
+    _check_agent_policy(
+        request, target_address=m.mailbox.address if m.mailbox else "",
+        is_send=payload is not None,
+    )
 
     codes = extract_verification_codes(m.subject, m.body_text)
     links = extract_links(m.body_text, m.body_html)

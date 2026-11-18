@@ -2,7 +2,9 @@ import base64
 from collections import OrderedDict
 import hashlib
 import hmac
+import sqlite3
 import json
+from contextlib import contextmanager
 import os
 import secrets
 import threading
@@ -43,10 +45,9 @@ MAX_FAILED_ATTEMPTS = 8
 LOCKOUT_WINDOW_SECONDS = 300
 MAX_TRACKED_IPS = 4096
 
-# Bounded server-side revoked session signatures (FIFO/LRU capped at 256)
-MAX_REVOKED_SESSIONS = 256
-_REVOKED_SESSION_LOCK = threading.Lock()
-_REVOKED_SESSION_SIGS: "OrderedDict[str, float]" = OrderedDict()
+# Durable session revocation is shared across workers and survives restarts.
+# Persist PRISM_DATA_DIR across deploys; do not place this file in ephemeral storage.
+_REVOKED_SESSIONS_DB = os.path.join(DATA_DIR, ".revoked_sessions.sqlite3")
 
 PUBLIC_EXACT_PATHS = {
     "/login",
@@ -177,24 +178,50 @@ def _clear_auth_attempts(bucket_key: str) -> None:
         _FAILED_LOGINS.pop(bucket_key, None)
 
 
+@contextmanager
+def _revocations_conn():
+    """Share revoked tokens via an on-disk SQLite table, closing each connection."""
+    conn = sqlite3.connect(_REVOKED_SESSIONS_DB, timeout=5)
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS revoked (sig TEXT PRIMARY KEY, expires INTEGER NOT NULL)")
+        if os.name != "nt":
+            os.chmod(_REVOKED_SESSIONS_DB, 0o600)
+        with conn:
+            yield conn
+    finally:
+        conn.close()
+
+
 def _revoke_session_token(token: Optional[str]) -> None:
     if not token or "." not in token:
         return
-    _, sig = token.split(".", 1)
+    b64, sig = token.split(".", 1)
     if not sig:
         return
-    with _REVOKED_SESSION_LOCK:
-        _REVOKED_SESSION_SIGS[sig] = time.time()
-        _REVOKED_SESSION_SIGS.move_to_end(sig)
-        while len(_REVOKED_SESSION_SIGS) > MAX_REVOKED_SESSIONS:
-            _REVOKED_SESSION_SIGS.popitem(last=False)
+    try:
+        raw = base64.urlsafe_b64decode(b64 + "=" * (-len(b64) % 4))
+        expires = int(json.loads(raw.decode("utf-8")).get("exp", 0))
+    except (ValueError, TypeError, UnicodeError):
+        return
+    if expires < int(time.time()):
+        return
+    with _revocations_conn() as conn:
+        conn.execute("INSERT OR REPLACE INTO revoked(sig, expires) VALUES (?, ?)", (sig, expires))
+        conn.execute("DELETE FROM revoked WHERE expires < ?", (int(time.time()),))
 
 
 def _is_session_sig_revoked(sig: str) -> bool:
     if not sig:
         return False
-    with _REVOKED_SESSION_LOCK:
-        return sig in _REVOKED_SESSION_SIGS
+    try:
+        with _revocations_conn() as conn:
+            return conn.execute(
+                "SELECT 1 FROM revoked WHERE sig = ? AND expires >= ?",
+                (sig, int(time.time())),
+            ).fetchone() is not None
+    except sqlite3.Error:
+        # Fail closed rather than accepting revoked cookies if the DB is broken.
+        return True
 
 
 def generate_api_key() -> str:
@@ -299,10 +326,11 @@ def verify_session_token(token: Optional[str], user: User) -> bool:
         return False
     try:
         b64, sig = token.split(".", 1)
-        if _is_session_sig_revoked(sig):
-            return False
         expected_sig = hmac.new(_signing_key(user), b64.encode("ascii"), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(sig, expected_sig):
+            return False
+        # Avoid an SQLite lookup for each invalid, unsigned cookie.
+        if _is_session_sig_revoked(sig):
             return False
         pad = "=" * (-len(b64) % 4)
         data = json.loads(base64.urlsafe_b64decode(b64 + pad).decode("utf-8"))
