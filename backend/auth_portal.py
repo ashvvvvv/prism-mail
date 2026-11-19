@@ -603,10 +603,11 @@ def get_agent_policy() -> dict:
         raw = (user.settings or {}) if user else {}
         policy = raw.get("agent_policy")
         if not isinstance(policy, dict):
-            return {"allow_send": True, "allowed_addresses": []}
+            return {"allow_send": True, "allow_sync": True, "allowed_addresses": []}
         allowed = policy.get("allowed_addresses")
         return {
             "allow_send": bool(policy.get("allow_send", True)),
+            "allow_sync": bool(policy.get("allow_sync", True)),
             "allowed_addresses": [str(a).strip().lower() for a in allowed if str(a).strip()] if isinstance(allowed, list) else [],
         }
 
