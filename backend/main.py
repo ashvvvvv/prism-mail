@@ -21,7 +21,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 if "ID" not in imaplib.Commands:
     imaplib.Commands["ID"] = ("NONAUTH", "AUTH", "SELECTED")
@@ -33,7 +33,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, RedirectResponse, Response
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
-from sqlalchemy import or_
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy import or_, func
 
 from database import (
     DATA_DIR, SessionLocal, init_db, User, Domain, Mailbox,
@@ -503,6 +504,14 @@ _AUTH_INTENT_TEXT_RE = re.compile(
 )
 
 
+def _url_path_and_query(url_str: str) -> str:
+    try:
+        parsed = urlsplit(url_str)
+        return f"{parsed.path or ''}?{parsed.query}" if parsed.query else (parsed.path or "")
+    except Exception:
+        return ""
+
+
 def extract_verification_links(
     subject: str,
     body_text: str,
@@ -516,12 +525,12 @@ def extract_verification_links(
     non_boilerplate = [u for u in links if not _NON_AUTH_LINK_RE.search(u)]
     if not non_boilerplate:
         return []
-    high_conf = [u for u in non_boilerplate if _HIGH_CONF_AUTH_URL_RE.search(u)]
+    high_conf = [u for u in non_boilerplate if _HIGH_CONF_AUTH_URL_RE.search(_url_path_and_query(u))]
     if high_conf:
         return high_conf
     sample = f"{(subject or '')[:2000]}\n{(body_text or '')[:50000]}"
     if _AUTH_INTENT_TEXT_RE.search(sample):
-        weak = [u for u in non_boilerplate if _WEAK_AUTH_URL_RE.search(u)]
+        weak = [u for u in non_boilerplate if _WEAK_AUTH_URL_RE.search(_url_path_and_query(u))]
         return weak or non_boilerplate
     return []
 
@@ -557,6 +566,54 @@ def normalize_to_utc_naive(dt: Optional[datetime]) -> datetime:
     if dt.tzinfo is not None:
         return dt.astimezone(timezone.utc).replace(tzinfo=None)
     return dt
+
+
+_FUTURE_SKEW_TOLERANCE = timedelta(minutes=5)
+
+
+def _resolve_mail_timestamps(
+    date_str: str,
+    server_received_at: Optional[datetime] = None,
+    fallback_to_header_for_received: bool = False,
+) -> tuple[datetime, datetime]:
+    """Resolve (created_at, received_at), preventing future-Date spoofing and preserving backfill dates."""
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    header_utc: Optional[datetime] = None
+    if date_str:
+        try:
+            header_utc = normalize_to_utc_naive(parsedate_to_datetime(date_str))
+        except Exception:
+            header_utc = None
+
+    if server_received_at is not None:
+        received_utc = normalize_to_utc_naive(server_received_at)
+    elif fallback_to_header_for_received and header_utc is not None:
+        received_utc = min(header_utc, now_utc)
+    else:
+        received_utc = now_utc
+
+    if received_utc > (now_utc + _FUTURE_SKEW_TOLERANCE):
+        received_utc = now_utc
+
+    if header_utc is not None:
+        created_utc = received_utc if header_utc > (now_utc + _FUTURE_SKEW_TOLERANCE) else header_utc
+    else:
+        created_utc = received_utc
+
+    return created_utc, received_utc
+
+
+def _parse_imap_internaldate(flags_and_headers: str) -> Optional[datetime]:
+    """Parse RFC 3501 INTERNALDATE attribute from an IMAP FETCH response header string."""
+    if not flags_and_headers:
+        return None
+    m = re.search(r'INTERNALDATE\s+"([^"]+)"', flags_and_headers, re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        return normalize_to_utc_naive(parsedate_to_datetime(m.group(1).strip()))
+    except Exception:
+        return None
 
 # ----------------- POSTFIX & DOVECOT SYSTEM PROVISIONING -----------------
 DOMAIN_RE = re.compile(r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,63}|xn--[a-z0-9-]{2,59})$")
@@ -784,19 +841,91 @@ def is_maildir_message_file(filename: str) -> bool:
         return False
     return True
 
-def sync_maildir_to_db(db: Session, force: bool = False, sync_external: Optional[bool] = None):
-    """Scan /var/vmail and sync real mailboxes and messages into SQLite without false deduplication."""
+def sync_maildir_to_db(
+    db: Session,
+    force: bool = False,
+    sync_external: Optional[bool] = None,
+    target_mailbox_id: Optional[int] = None,
+    target_address: Optional[str] = None,
+    target_domain: Optional[str] = None,
+    allowed_addresses: Optional[List[str]] = None,
+):
+    """Scan /var/vmail (full or targeted) and sync real mailboxes and messages idempotently."""
     global _last_sync_ts
     do_sync_external = force if sync_external is None else bool(sync_external)
+    is_targeted = bool(
+        target_mailbox_id
+        or target_address
+        or target_domain
+        or (allowed_addresses and len(allowed_addresses) <= 10)
+    )
     now_ts = time.time()
-    if not force and (now_ts - _last_sync_ts) < 2.0:
+    if not is_targeted and not force and (now_ts - _last_sync_ts) < 2.0:
         return
 
     with _sync_lock:
         now_ts = time.time()
-        if not force and (now_ts - _last_sync_ts) < 2.0:
+        if not is_targeted and not force and (now_ts - _last_sync_ts) < 2.0:
             return
-        _last_sync_ts = now_ts
+        if not is_targeted:
+            _last_sync_ts = now_ts
+
+        allowed_domains: Optional[set[str]] = None
+        allowed_pairs: Optional[set[tuple[str, str]]] = None
+        allowed_prefixes: Optional[set[str]] = None
+
+        if target_mailbox_id:
+            mb_t = db.get(Mailbox, target_mailbox_id)
+            if (
+                not mb_t
+                or mb_t.is_external
+                or not mb_t.domain
+                or getattr(mb_t.domain, "is_external", False)
+            ):
+                return
+            t_dom = mb_t.domain.name.strip().lower()
+            t_pfx = mb_t.prefix.strip().lower()
+            allowed_domains = {t_dom}
+            allowed_pairs = {(t_dom, t_pfx)}
+        elif target_address:
+            addr = target_address.strip().lower()
+            if "@" in addr:
+                t_pfx, t_dom = addr.split("@", 1)
+                if db.query(Domain.id).filter(Domain.name == t_dom, Domain.is_external == True).first():
+                    return
+                if db.query(Mailbox.id).filter(Mailbox.address == addr, Mailbox.is_external == True).first():
+                    return
+                allowed_domains = {t_dom}
+                allowed_pairs = {(t_dom, t_pfx)}
+            elif addr:
+                allowed_prefixes = {addr}
+        elif target_domain:
+            t_dom = target_domain.strip().lower()
+            if db.query(Domain.id).filter(Domain.name == t_dom, Domain.is_external == True).first():
+                return
+            if t_dom:
+                allowed_domains = {t_dom}
+
+        if allowed_addresses:
+            policy_pairs = {
+                (a.split("@", 1)[1].strip().lower(), a.split("@", 1)[0].strip().lower())
+                for a in allowed_addresses
+                if "@" in a
+            }
+            if not policy_pairs:
+                return
+            if allowed_pairs is not None:
+                allowed_pairs &= policy_pairs
+            elif allowed_prefixes is not None:
+                allowed_pairs = {(d, p) for d, p in policy_pairs if p in allowed_prefixes}
+            elif allowed_domains is not None:
+                allowed_pairs = {(d, p) for d, p in policy_pairs if d in allowed_domains}
+            elif len(allowed_addresses) <= 10:
+                allowed_pairs = policy_pairs
+            if allowed_pairs is not None:
+                if not allowed_pairs:
+                    return
+                allowed_domains = {d for d, _ in allowed_pairs}
 
         # 1. Ensure master user exists
         user = db.query(User).first()
@@ -811,44 +940,54 @@ def sync_maildir_to_db(db: Session, force: bool = False, sync_external: Optional
             db.add(user)
             db.commit()
 
-        # Ensure default business groups and labels exist (commit only on insert)
+        # Ensure default business groups and labels exist (batched into 2 queries)
         default_groups = [
             {"name": "核心日常与管理", "icon": "Shield", "color": "#6366f1", "sort_order": 1},
             {"name": "监控与运维告警", "icon": "Activity", "color": "#f59e0b", "sort_order": 2},
             {"name": "AI Agent 自动化", "icon": "Bot", "color": "#a855f7", "sort_order": 3},
             {"name": "账单与财务结算", "icon": "CreditCard", "color": "#10b981", "sort_order": 4},
         ]
+        grp_by_name = {g.name: g for g in db.query(MailboxGroup).all()}
+        lbl_by_name = {l.name: l for l in db.query(MailboxLabel).all()}
         defaults_dirty = False
         for dg in default_groups:
-            grp = db.query(MailboxGroup).filter(MailboxGroup.name == dg["name"]).first()
-            if not grp:
+            if dg["name"] not in grp_by_name:
                 grp = MailboxGroup(user_id=user.id, **dg)
                 db.add(grp)
+                grp_by_name[dg["name"]] = grp
                 defaults_dirty = True
-            lbl = db.query(MailboxLabel).filter(MailboxLabel.name == dg["name"]).first()
-            if not lbl:
+            if dg["name"] not in lbl_by_name:
                 lbl = MailboxLabel(user_id=user.id, **dg)
                 db.add(lbl)
+                lbl_by_name[dg["name"]] = lbl
                 defaults_dirty = True
         if defaults_dirty:
             db.commit()
 
-        grp_core = db.query(MailboxGroup).filter(MailboxGroup.name == "核心日常与管理").first()
-        grp_alert = db.query(MailboxGroup).filter(MailboxGroup.name == "监控与运维告警").first()
-        grp_ai = db.query(MailboxGroup).filter(MailboxGroup.name == "AI Agent 自动化").first()
-        grp_finance = db.query(MailboxGroup).filter(MailboxGroup.name == "账单与财务结算").first()
+        grp_core = grp_by_name.get("核心日常与管理")
+        grp_alert = grp_by_name.get("监控与运维告警")
+        grp_ai = grp_by_name.get("AI Agent 自动化")
+        grp_finance = grp_by_name.get("账单与财务结算")
 
-        lbl_core = db.query(MailboxLabel).filter(MailboxLabel.name == "核心日常与管理").first()
-        lbl_alert = db.query(MailboxLabel).filter(MailboxLabel.name == "监控与运维告警").first()
-        lbl_ai = db.query(MailboxLabel).filter(MailboxLabel.name == "AI Agent 自动化").first()
-        lbl_finance = db.query(MailboxLabel).filter(MailboxLabel.name == "账单与财务结算").first()
+        lbl_core = lbl_by_name.get("核心日常与管理")
+        lbl_alert = lbl_by_name.get("监控与运维告警")
+        lbl_ai = lbl_by_name.get("AI Agent 自动化")
+        lbl_finance = lbl_by_name.get("账单与财务结算")
 
         if not os.path.exists(VMAIL_DIR):
             return
 
-        # 2. Discover domains in /var/vmail
+        # 2. Discover domains in /var/vmail (direct lookup when targeted)
         IGNORE_DIRS = {"sieve", "lost+found", ".trash"}
-        for raw_domain_name in os.listdir(VMAIL_DIR):
+        if allowed_domains is not None:
+            raw_domain_names = [
+                d for d in sorted(allowed_domains)
+                if os.path.isdir(os.path.join(VMAIL_DIR, d))
+            ]
+        else:
+            raw_domain_names = os.listdir(VMAIL_DIR)
+
+        for raw_domain_name in raw_domain_names:
             domain_name = raw_domain_name.strip().lower()
             if (
                 raw_domain_name.startswith(".")
@@ -876,8 +1015,21 @@ def sync_maildir_to_db(db: Session, force: bool = False, sync_external: Optional
                 db.commit()
                 db.refresh(domain)
 
-            # 3. Discover mailboxes under this domain
-            for raw_prefix in os.listdir(domain_path):
+            # 3. Discover mailboxes under this domain (direct lookup when targeted)
+            if allowed_pairs is not None:
+                raw_prefixes = [
+                    p for d, p in sorted(allowed_pairs)
+                    if d == domain_name and os.path.isdir(os.path.join(domain_path, p))
+                ]
+            elif allowed_prefixes is not None:
+                raw_prefixes = [
+                    p for p in sorted(allowed_prefixes)
+                    if os.path.isdir(os.path.join(domain_path, p))
+                ]
+            else:
+                raw_prefixes = os.listdir(domain_path)
+
+            for raw_prefix in raw_prefixes:
                 prefix = raw_prefix.strip().lower()
                 if raw_prefix.startswith(".") or ".." in prefix or not MAILBOX_PREFIX_RE.match(prefix):
                     continue
@@ -954,13 +1106,20 @@ def sync_maildir_to_db(db: Session, force: bool = False, sync_external: Optional
                     ("trash", os.path.join(".Trash", "new"), False),
                 ]
 
+                # Load lightweight column tuples instead of hydrating body blobs for every existing message.
                 existing_mail_map = {
-                    m_row.maildir_key: m_row
-                    for m_row in db.query(Mail).filter(
+                    row.maildir_key: (row.id, row.maildir_path, row.is_deleted, row.preview)
+                    for row in db.query(
+                        Mail.id,
+                        Mail.maildir_key,
+                        Mail.maildir_path,
+                        Mail.is_deleted,
+                        Mail.preview,
+                    ).filter(
                         Mail.mailbox_id == mb.id,
                         Mail.maildir_key.isnot(None),
                     ).all()
-                    if m_row.maildir_key
+                    if row.maildir_key
                 }
                 mailbox_dirty = False
 
@@ -980,23 +1139,32 @@ def sync_maildir_to_db(db: Session, force: bool = False, sync_external: Optional
                         maildir_key = f"{mb.id}:{base_key}"
 
                         # 1) Fast check by maildir_key
-                        existing_by_key = existing_mail_map.get(maildir_key)
-                        if existing_by_key:
-                            if existing_by_key.is_deleted:
+                        existing_info = existing_mail_map.get(maildir_key)
+                        if existing_info is not None:
+                            e_id, e_path, e_deleted, e_prev = existing_info
+                            if e_deleted:
                                 continue
-                            # Update path if moved between new/ and cur/
-                            dirty = False
-                            if existing_by_key.maildir_path != file_full:
-                                existing_by_key.maildir_path = file_full
-                                dirty = True
-                            # Clean legacy raw HTML previews if any
-                            if existing_by_key.body_html and (not existing_by_key.body_text or existing_by_key.preview.lstrip().startswith("<")):
-                                existing_by_key.body_text = html_to_plain_text(existing_by_key.body_html)
-                                existing_by_key.preview = build_clean_preview(existing_by_key.body_text, existing_by_key.body_html)
-                                dirty = True
-                            if dirty:
-                                db.add(existing_by_key)
-                                mailbox_dirty = True
+                            needs_path = e_path != file_full
+                            needs_preview = bool((e_prev or "").lstrip().startswith("<"))
+                            if needs_path or needs_preview:
+                                existing_by_key = db.get(Mail, e_id)
+                                if existing_by_key and not existing_by_key.is_deleted:
+                                    dirty = False
+                                    if existing_by_key.maildir_path != file_full:
+                                        existing_by_key.maildir_path = file_full
+                                        dirty = True
+                                    if existing_by_key.body_html and (not existing_by_key.body_text or (existing_by_key.preview or "").lstrip().startswith("<")):
+                                        existing_by_key.body_text = html_to_plain_text(existing_by_key.body_html)
+                                        existing_by_key.preview = build_clean_preview(existing_by_key.body_text, existing_by_key.body_html)
+                                        dirty = True
+                                    if dirty:
+                                        existing_mail_map[maildir_key] = (
+                                            existing_by_key.id,
+                                            existing_by_key.maildir_path,
+                                            existing_by_key.is_deleted,
+                                            existing_by_key.preview,
+                                        )
+                                        mailbox_dirty = True
                             continue
 
                         # Parse message file
@@ -1012,19 +1180,11 @@ def sync_maildir_to_db(db: Session, force: bool = False, sync_external: Optional
                         msg_id = str(msg.get("Message-ID", "") or "").strip()
                         date_str = str(msg.get("Date", "") or "").strip()
 
-                        mail_date = None
-                        if date_str:
-                            try:
-                                parsed_dt = parsedate_to_datetime(date_str)
-                                mail_date = normalize_to_utc_naive(parsed_dt)
-                            except Exception:
-                                mail_date = None
-                        if not mail_date:
-                            try:
-                                mtime = os.path.getmtime(file_full)
-                                mail_date = datetime.fromtimestamp(mtime, tz=timezone.utc).replace(tzinfo=None)
-                            except Exception:
-                                mail_date = datetime.now(timezone.utc).replace(tzinfo=None)
+                        try:
+                            file_mtime = datetime.fromtimestamp(os.path.getmtime(file_full), tz=timezone.utc).replace(tzinfo=None)
+                        except Exception:
+                            file_mtime = None
+                        mail_date, received_date = _resolve_mail_timestamps(date_str, server_received_at=file_mtime)
 
                         body_text, body_html, attachments = extract_mime_bodies_and_attachments(msg)
                         preview = build_clean_preview(body_text, body_html)
@@ -1050,24 +1210,34 @@ def sync_maildir_to_db(db: Session, force: bool = False, sync_external: Optional
                         )
 
                         if legacy_row:
-                            legacy_row.maildir_key = maildir_key
-                            legacy_row.maildir_path = file_full
-                            legacy_row.message_id = msg_id
-                            legacy_row.subject = subject
-                            legacy_row.sender = sender
-                            legacy_row.created_at = mail_date
-                            if body_text:
-                                legacy_row.body_text = body_text
-                            if body_html:
-                                legacy_row.body_html = body_html
-                            legacy_row.preview = preview
-                            if attachments:
-                                legacy_row.has_attachments = True
-                                legacy_row.attachments_json = json.dumps(attachments, ensure_ascii=False)
-                            db.add(legacy_row)
-                            db.flush()
-                            existing_mail_map[maildir_key] = legacy_row
-                            mailbox_dirty = True
+                            try:
+                                with db.begin_nested():
+                                    legacy_row.maildir_key = maildir_key
+                                    legacy_row.maildir_path = file_full
+                                    legacy_row.message_id = msg_id
+                                    legacy_row.subject = subject
+                                    legacy_row.sender = sender
+                                    legacy_row.created_at = mail_date
+                                    legacy_row.received_at = received_date
+                                    if body_text:
+                                        legacy_row.body_text = body_text
+                                    if body_html:
+                                        legacy_row.body_html = body_html
+                                    legacy_row.preview = preview
+                                    if attachments:
+                                        legacy_row.has_attachments = True
+                                        legacy_row.attachments_json = json.dumps(attachments, ensure_ascii=False)
+                                    db.add(legacy_row)
+                                    db.flush()
+                                existing_mail_map[maildir_key] = (
+                                    legacy_row.id,
+                                    file_full,
+                                    False,
+                                    preview,
+                                )
+                                mailbox_dirty = True
+                            except IntegrityError:
+                                existing_mail_map[maildir_key] = (0, file_full, False, preview)
                             continue
 
                         # 3) Otherwise insert new Mail record
@@ -1104,11 +1274,22 @@ def sync_maildir_to_db(db: Session, force: bool = False, sync_external: Optional
                             maildir_key=maildir_key,
                             maildir_path=file_full,
                             message_id=msg_id,
-                            created_at=mail_date
+                            created_at=mail_date,
+                            received_at=received_date,
                         )
-                        db.add(mail_entry)
-                        existing_mail_map[maildir_key] = mail_entry
-                        mailbox_dirty = True
+                        try:
+                            with db.begin_nested():
+                                db.add(mail_entry)
+                                db.flush()
+                            existing_mail_map[maildir_key] = (
+                                mail_entry.id,
+                                file_full,
+                                False,
+                                preview,
+                            )
+                            mailbox_dirty = True
+                        except IntegrityError:
+                            existing_mail_map[maildir_key] = (0, file_full, False, preview)
 
                 if mailbox_dirty:
                     db.commit()
@@ -1494,6 +1675,8 @@ def sync_single_external_mailbox(
             # UIDVALIDITY changes are a new UID namespace; preserve old messages
             # and their cached MIME data instead of reusing their identifiers.
             mb.imap_uidvalidity = uidvalidity
+            if previous_uidvalidity != uidvalidity:
+                db.commit()
 
             typ, search_data = imap.uid("search", None, "ALL")
             if typ != "OK" or not search_data or not search_data[0]:
@@ -1550,7 +1733,7 @@ def sync_single_external_mailbox(
             completed_uids: set[str] = set()
             for uid_str in selected_uids:
                 try:
-                    typ, fetch_data = imap.uid("fetch", uid_str, "(BODY.PEEK[] FLAGS)")
+                    typ, fetch_data = imap.uid("fetch", uid_str, "(BODY.PEEK[] FLAGS INTERNALDATE)")
                     if typ != "OK" or not fetch_data:
                         continue
 
@@ -1574,15 +1757,12 @@ def sync_single_external_mailbox(
                     msg_id = str(msg.get("Message-ID", "") or "").strip()
                     date_str = str(msg.get("Date", "") or "").strip()
 
-                    mail_date = None
-                    if date_str:
-                        try:
-                            parsed_dt = parsedate_to_datetime(date_str)
-                            mail_date = normalize_to_utc_naive(parsed_dt)
-                        except Exception:
-                            mail_date = None
-                    if not mail_date:
-                        mail_date = datetime.now(timezone.utc).replace(tzinfo=None)
+                    internal_dt = _parse_imap_internaldate(flags_str)
+                    mail_date, received_date = _resolve_mail_timestamps(
+                        date_str,
+                        server_received_at=internal_dt,
+                        fallback_to_header_for_received=True,
+                    )
 
                     body_text, body_html, attachments = extract_mime_bodies_and_attachments(msg)
                     preview = build_clean_preview(body_text, body_html)
@@ -1627,10 +1807,15 @@ def sync_single_external_mailbox(
                         maildir_key=f"imap:{mb.id}:{uidvalidity}:{uid_str}",
                         maildir_path=cached_eml_path,
                         message_id=msg_id,
-                        created_at=mail_date
+                        created_at=mail_date,
+                        received_at=received_date,
                     )
-                    db.add(mail_entry)
-                    new_count += 1
+                    try:
+                        db.add(mail_entry)
+                        db.commit()
+                        new_count += 1
+                    except IntegrityError:
+                        db.rollback()
                     completed_uids.add(uid_str)
                 except Exception as inner_e:
                     print(f"IMAP fetch UID {uid_str} notice ({mb.address}): {inner_e}")
@@ -3487,6 +3672,7 @@ def serialize_agent_mail(m: Mail, include_body: bool = True, include_html: bool 
         "attachments": enrich_mail_attachments(m.id, m.attachments),
         "ai_summary": m.ai_summary,
         "created_at": format_utc_iso(m.created_at),
+        "received_at": format_utc_iso(m.received_at or m.created_at),
     }
     if include_body:
         data["body_text"] = m.body_text
@@ -3636,14 +3822,24 @@ def agent_list_mails(
     """Query emails for AI Agents (Hermes) with clean plain text and extracted codes/links."""
     pol = _check_agent_policy(request, is_send=mark_read and _is_csrf_safe_get_mutation(request))
     allow_get_mutation = _is_csrf_safe_get_mutation(request)
-    # Local Maildir scan runs unthrottled without blocking on unrelated remote IMAP accounts.
-    sync_maildir_to_db(db, force=True, sync_external=False)
+    # Use targeted Maildir scan when scoped; fall back to throttled global scan only on unfiltered queries.
+    allowed_addrs = pol.get("allowed_addresses") if pol else None
+    has_local_target = bool(mailbox_id or address or domain or allowed_addrs)
+    sync_maildir_to_db(
+        db,
+        force=has_local_target,
+        sync_external=False,
+        target_mailbox_id=mailbox_id,
+        target_address=address,
+        target_domain=domain,
+        allowed_addresses=allowed_addrs,
+    )
     sync_target_external_mailboxes_for_agent(
         db,
         mailbox_id=mailbox_id,
         address=address,
         domain=domain,
-        allowed_addresses=pol.get("allowed_addresses") if pol else None,
+        allowed_addresses=allowed_addrs,
     )
     q = db.query(Mail).filter(Mail.is_deleted == False)
 
@@ -3715,11 +3911,19 @@ def agent_get_latest_mail_or_code(
     """Fetch the single newest matching email, or newest recent OTP/magic-link candidate for /api/agent/code."""
     pol = _check_agent_policy(request, is_send=mark_read and _is_csrf_safe_get_mutation(request))
     allow_get_mutation = _is_csrf_safe_get_mutation(request)
-    sync_maildir_to_db(db, force=True, sync_external=False)
+    allowed_addrs = pol.get("allowed_addresses") if pol else None
+    has_local_target = bool(address or allowed_addrs)
+    sync_maildir_to_db(
+        db,
+        force=has_local_target,
+        sync_external=False,
+        target_address=address,
+        allowed_addresses=allowed_addrs,
+    )
     sync_target_external_mailboxes_for_agent(
         db,
         address=address,
-        allowed_addresses=pol.get("allowed_addresses") if pol else None,
+        allowed_addresses=allowed_addrs,
     )
     q = db.query(Mail).filter(Mail.is_deleted == False, Mail.folder == "inbox")
 
@@ -3740,18 +3944,18 @@ def agent_get_latest_mail_or_code(
     if unread_only:
         q = q.filter(Mail.is_read == False)
 
+    effective_received = func.coalesce(Mail.received_at, Mail.created_at)
     is_code_endpoint = request.url.path.rstrip("/") == "/api/agent/code"
     effective_window = DEFAULT_AGENT_CODE_WINDOW_MINUTES if (within_minutes is None and is_code_endpoint) else within_minutes
     if effective_window is not None and effective_window > 0:
         cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=effective_window)
-        q = q.filter(Mail.created_at >= cutoff)
+        q = q.filter(effective_received >= cutoff)
 
     if is_code_endpoint:
-        # Inspect recent candidates newest-first and accept either numeric OTPs or
-        # credible verification/magic links so newer Magic Links win over older OTPs
-        # while plain newsletters are skipped.
+        # Inspect recent candidates by server reception time newest-first so future
+        # Date headers cannot poison selection and delayed delivery still stays fresh.
         m = None
-        candidates = q.order_by(Mail.created_at.desc(), Mail.id.desc()).limit(MAX_AGENT_CODE_SCAN).all()
+        candidates = q.order_by(effective_received.desc(), Mail.id.desc()).limit(MAX_AGENT_CODE_SCAN).all()
         for cand in candidates:
             if (
                 extract_verification_codes(cand.subject, cand.body_text)
@@ -3760,7 +3964,7 @@ def agent_get_latest_mail_or_code(
                 m = cand
                 break
     else:
-        m = q.order_by(Mail.created_at.desc(), Mail.id.desc()).first()
+        m = q.order_by(effective_received.desc(), Mail.id.desc()).first()
 
     if not m:
         return {"found": False, "mail": None, "verification_code": None, "verification_codes": [], "links": []}
@@ -3787,8 +3991,10 @@ def agent_get_mail_detail(
     db: Session = Depends(get_db)
 ):
     """Read full email content and extracted metadata for an external AI Agent."""
-    sync_maildir_to_db(db, force=True, sync_external=False)
     m = db.query(Mail).filter(Mail.id == mail_id, Mail.is_deleted == False).first()
+    if not m:
+        sync_maildir_to_db(db, force=False, sync_external=False)
+        m = db.query(Mail).filter(Mail.id == mail_id, Mail.is_deleted == False).first()
     if not m:
         raise HTTPException(status_code=404, detail="Mail not found")
     _check_agent_policy(
@@ -3997,7 +4203,12 @@ def agent_reply_mail(payload: AgentReplyMailPayload, request: Request, db: Sessi
 def agent_list_mailboxes(request: Request, db: Session = Depends(get_db)):
     """List all mailboxes and their unread counts for AI Agents."""
     pol = _check_agent_policy(request)
-    sync_maildir_to_db(db, force=True, sync_external=False)
+    sync_maildir_to_db(
+        db,
+        force=False,
+        sync_external=False,
+        allowed_addresses=pol.get("allowed_addresses") if pol else None,
+    )
     q = db.query(Mailbox)
     if pol and pol.get("allowed_addresses"):
         q = q.filter(Mailbox.address.in_(pol["allowed_addresses"]))

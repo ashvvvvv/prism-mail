@@ -8,6 +8,7 @@ import time
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
+from sqlalchemy.exc import IntegrityError
 
 import test_security_and_api as fixtures
 
@@ -592,3 +593,249 @@ def test_logout_cookie_rejected_after_simulated_restart():
     restarted.cookies.set(auth_portal.COOKIE_NAME, cookie_val)
     assert restarted.get("/api/auth/me").status_code == 401
     assert restarted.get("/api/mails").status_code == 401
+
+
+def test_targeted_local_maildir_scan_skips_unrelated_mailboxes():
+    client = _admin_client()
+    api_key = client.post("/api/auth/rotate-api-key", headers=fixtures.CSRF_HEADERS).json()["api_key"]
+    agent = TestClient(main.app)
+    hdrs = {"Authorization": f"Bearer {api_key}"}
+
+    target_dir = os.path.join(fixtures._VMAIL_DIR, "policytest.org", "targetscan", "Maildir", "new")
+    unrelated_dir = os.path.join(fixtures._VMAIL_DIR, "policytest.org", "unrelatedscan", "Maildir", "new")
+    os.makedirs(target_dir, exist_ok=True)
+    os.makedirs(unrelated_dir, exist_ok=True)
+    target_eml = os.path.join(target_dir, "target_otp_001")
+    unrelated_eml = os.path.join(unrelated_dir, "unrelated_otp_001")
+
+    with open(target_eml, "wb") as fh:
+        fh.write(_build_raw_eml("auth@svc.example", "targetscan@policytest.org", "Target Code 135790", "Code: 135790"))
+    with open(unrelated_eml, "wb") as fh:
+        fh.write(_build_raw_eml("auth@svc.example", "unrelatedscan@policytest.org", "Other Code 246810", "Code: 246810"))
+
+    try:
+        main._last_sync_ts = time.time()
+        res = agent.get("/api/agent/code?address=targetscan@policytest.org", headers=hdrs)
+        assert res.status_code == 200
+        assert res.json()["found"] is True
+        assert res.json()["verification_code"] == "135790"
+
+        # Sibling mailbox must NOT have been scanned or imported during targeted poll.
+        with database.SessionLocal() as db:
+            assert db.query(database.Mailbox).filter_by(address="unrelatedscan@policytest.org").first() is None
+            main.sync_maildir_to_db(db, force=True, sync_external=False)
+            assert db.query(database.Mailbox).filter_by(address="unrelatedscan@policytest.org").first() is not None
+    finally:
+        for p in (target_eml, unrelated_eml):
+            if os.path.exists(p):
+                os.unlink(p)
+
+
+def test_unique_maildir_key_constraint_prevents_duplicate_import():
+    _admin_client()
+    with database.SessionLocal() as db:
+        ext_dom = db.query(database.Domain).filter_by(name="gmail.com").first()
+        pol_dom = db.query(database.Domain).filter_by(name="policytest.org").first()
+        local_mb = database.Mailbox(domain_id=pol_dom.id, prefix="uniqcheck", address="uniqcheck@policytest.org", name="Uniq")
+        ext_mb = database.Mailbox(
+            domain_id=ext_dom.id,
+            prefix="racetest",
+            address="racetest@gmail.com",
+            name="RaceTest",
+            is_external=True,
+            provider="gmail",
+            imap_host="imap.gmail.com",
+            imap_port=993,
+        )
+        ext_mb.set_auth_password("fake-application-password")
+        db.add_all([local_mb, ext_mb])
+        db.commit()
+        local_id, ext_id = local_mb.id, ext_mb.id
+
+        # NULL maildir_key rows may coexist freely (e.g. outbound/legacy mails),
+        # while duplicate non-NULL (mailbox_id, maildir_key) must fail cleanly.
+        db.add_all([
+            database.Mail(mailbox_id=local_id, folder="sent", sender="a@b.com", recipient="c@d.com", subject="S1", maildir_key=None),
+            database.Mail(mailbox_id=local_id, folder="sent", sender="a@b.com", recipient="c@d.com", subject="S2", maildir_key=None),
+            database.Mail(mailbox_id=local_id, folder="inbox", sender="a@b.com", recipient="c@d.com", subject="K1", maildir_key=f"{local_id}:dup_msg"),
+        ])
+        db.commit()
+
+        dup_err = False
+        try:
+            db.add(database.Mail(mailbox_id=local_id, folder="inbox", sender="a@b.com", recipient="c@d.com", subject="K1-dup", maildir_key=f"{local_id}:dup_msg"))
+            db.commit()
+        except IntegrityError:
+            dup_err = True
+            db.rollback()
+        assert dup_err is True
+
+    # Simulate another worker inserting UID 2 while Worker 1 is mid-FETCH across UIDs 1..3.
+    class RacingIMAP:
+        def __init__(self, *args, **kwargs): pass
+        def login(self, *args): pass
+        def _simple_command(self, *args): pass
+        def select(self, *args, **kwargs): return ("OK", [b"3"])
+        def response(self, code): return ("UIDVALIDITY", [b"888"])
+        def uid(self, action, *args):
+            if action == "search":
+                return ("OK", [b"1 2 3"])
+            if action == "fetch":
+                uid_s = str(args[0])
+                if uid_s == "2":
+                    with database.SessionLocal() as other_worker_db:
+                        other_worker_db.add(database.Mail(
+                            mailbox_id=ext_id,
+                            folder="inbox",
+                            sender="other@example.net",
+                            recipient="racetest@gmail.com",
+                            subject="Worker 2 won UID 2",
+                            body_text="Winner",
+                            maildir_key=f"imap:{ext_id}:888:2",
+                        ))
+                        other_worker_db.commit()
+                raw = _build_raw_eml("src@example.net", "racetest@gmail.com", f"UID {uid_s}", f"Body {uid_s}")
+                return ("OK", [(b'1 (FLAGS () INTERNALDATE "18-Nov-2026 10:00:00 +0000")', raw)])
+            raise AssertionError(action)
+        def logout(self): pass
+
+    with patch.object(main, "validate_external_mail_endpoint", return_value=["127.0.0.1"]), \
+         patch.object(main, "SafeIMAP4_SSL", RacingIMAP):
+        with database.SessionLocal() as db:
+            mb = db.get(database.Mailbox, ext_id)
+            imported = main.sync_single_external_mailbox(db, mb, max_fetch=10)
+            assert imported == 2  # UIDs 1 and 3 succeed; UID 2 conflict skipped via savepoint
+            rows = db.query(database.Mail).filter_by(mailbox_id=ext_id).all()
+            assert len(rows) == 3
+            assert len({r.maildir_key for r in rows}) == 3
+
+
+def test_agent_code_uses_server_received_at_and_clamps_future_dates():
+    client = _admin_client()
+    newdir = os.path.join(fixtures._VMAIL_DIR, "policytest.org", "clockskew", "Maildir", "new")
+    os.makedirs(newdir, exist_ok=True)
+    spoof_future_file = os.path.join(newdir, "spoof_future_old_otp")
+    clock_skew_file = os.path.join(newdir, "skewed_fresh_otp")
+
+    eml_future = EmailMessage()
+    eml_future["From"] = "spammer@evil.example"
+    eml_future["To"] = "clockskew@policytest.org"
+    eml_future["Subject"] = "Future Code 999111"
+    eml_future["Date"] = "Thu, 01 Jan 2099 00:00:00 +0000"
+    eml_future.set_content("Your code is 999111")
+
+    with open(spoof_future_file, "wb") as fh:
+        fh.write(eml_future.as_bytes())
+    two_hours_ago = time.time() - 7200
+    os.utime(spoof_future_file, (two_hours_ago, two_hours_ago))
+
+    try:
+        # Spoofed future Date + 2h-old mtime must be clamped and excluded from 30m window.
+        res1 = client.get("/api/agent/code?address=clockskew@policytest.org")
+        assert res1.status_code == 200
+        assert res1.json()["found"] is False
+
+        with database.SessionLocal() as db:
+            row = db.query(database.Mail).filter_by(subject="Future Code 999111").first()
+            assert row is not None
+            now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+            assert row.created_at <= now_naive + timedelta(minutes=5)
+            assert (now_naive - row.received_at) > timedelta(minutes=90)
+
+        # Now deliver a legitimate email whose sender clock is 3h slow, but server mtime is now.
+        eml_slow = EmailMessage()
+        eml_slow["From"] = "otp@valid.example"
+        eml_slow["To"] = "clockskew@policytest.org"
+        eml_slow["Subject"] = "Real Fresh Code 518293"
+        eml_slow["Date"] = (datetime.now(timezone.utc) - timedelta(hours=3)).strftime("%a, %d %b %Y %H:%M:%S +0000")
+        eml_slow.set_content("Your verification code is 518293")
+        with open(clock_skew_file, "wb") as fh:
+            fh.write(eml_slow.as_bytes())
+
+        res2 = client.get("/api/agent/code?address=clockskew@policytest.org")
+        assert res2.status_code == 200
+        assert res2.json()["found"] is True
+        assert res2.json()["verification_code"] == "518293"
+
+        # Historical IMAP backfill carrying 2024 INTERNALDATE must NOT match the 30-min OTP window.
+        with database.SessionLocal() as db:
+            ext_dom = db.query(database.Domain).filter_by(name="gmail.com").first()
+            ext_mb = database.Mailbox(
+                domain_id=ext_dom.id,
+                prefix="internaldate",
+                address="internaldate@gmail.com",
+                name="InternalDate",
+                is_external=True,
+                provider="gmail",
+                imap_host="imap.gmail.com",
+                imap_port=993,
+            )
+            ext_mb.set_auth_password("fake-application-password")
+            db.add(ext_mb)
+            db.commit()
+            ext_id = ext_mb.id
+
+        class OldInternalDateIMAP:
+            def __init__(self, *args, **kwargs): pass
+            def login(self, *args): pass
+            def _simple_command(self, *args): pass
+            def select(self, *args, **kwargs): return ("OK", [b"1"])
+            def response(self, code): return ("UIDVALIDITY", [b"600"])
+            def uid(self, action, *args):
+                if action == "search":
+                    return ("OK", [b"1"])
+                if action == "fetch":
+                    raw = _build_raw_eml(
+                        "old@service.example",
+                        "internaldate@gmail.com",
+                        "Old Backfill Code 445566",
+                        "Your code is 445566",
+                    )
+                    return ("OK", [(b'1 (FLAGS (\\Seen) INTERNALDATE "01-May-2024 10:00:00 +0000")', raw)])
+                raise AssertionError(action)
+            def logout(self): pass
+
+        with patch.object(main, "validate_external_mail_endpoint", return_value=["127.0.0.1"]), \
+             patch.object(main, "SafeIMAP4_SSL", OldInternalDateIMAP):
+            with database.SessionLocal() as db:
+                mb = db.get(database.Mailbox, ext_id)
+                assert main.sync_single_external_mailbox(db, mb, max_fetch=10) == 1
+                old_row = db.query(database.Mail).filter_by(mailbox_id=ext_id).first()
+                assert old_row.received_at.year == 2024
+
+            old_res = client.get("/api/agent/code?address=internaldate@gmail.com")
+            assert old_res.status_code == 200
+            assert old_res.json()["found"] is False
+    finally:
+        for p in (spoof_future_file, clock_skew_file):
+            if os.path.exists(p):
+                os.unlink(p)
+
+
+def test_magic_link_ignores_verify_keyword_in_domain_hostname():
+    client = _admin_client()
+    assert main.extract_verification_links(
+        "Weekly Digest",
+        "Read https://verify-news.example/articles/weekly and https://confirm-blog.example/post/42",
+        "",
+    ) == []
+
+    with database.SessionLocal() as db:
+        pol_dom = db.query(database.Domain).filter_by(name="policytest.org").first()
+        mb = database.Mailbox(domain_id=pol_dom.id, prefix="hostfalsepos", address="hostfalsepos@policytest.org", name="HostFP")
+        db.add(mb)
+        db.commit()
+        db.add(database.Mail(
+            mailbox_id=mb.id,
+            folder="inbox",
+            sender="newsletter@verify-news.example",
+            recipient=mb.address,
+            subject="Daily Editorial",
+            body_text="Read today's highlights at https://verify-news.example/articles/weekly",
+            body_html='<a href="https://verify-news.example/articles/weekly">Read article</a>',
+        ))
+        db.commit()
+
+    res = client.get("/api/agent/code?address=hostfalsepos@policytest.org")
+    assert res.status_code == 200
+    assert res.json()["found"] is False
