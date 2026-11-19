@@ -2,6 +2,7 @@ import base64
 from collections import OrderedDict
 import hashlib
 import hmac
+import sqlite3
 import json
 import os
 import secrets
@@ -43,10 +44,15 @@ MAX_FAILED_ATTEMPTS = 8
 LOCKOUT_WINDOW_SECONDS = 300
 MAX_TRACKED_IPS = 4096
 
-# Bounded server-side revoked session signatures (FIFO/LRU capped at 256)
-MAX_REVOKED_SESSIONS = 256
-_REVOKED_SESSION_LOCK = threading.Lock()
-_REVOKED_SESSION_SIGS: "OrderedDict[str, float]" = OrderedDict()
+# Durable session revocation is shared across workers and survives restarts.
+# Persist PRISM_DATA_DIR across deploys; do not place this file in ephemeral storage.
+_REVOKED_SESSIONS_DB = os.path.join(DATA_DIR, ".revoked_sessions.sqlite3")
+_REVOCATION_INIT_LOCK = threading.Lock()
+_INITIALIZED_REVOCATION_DBS: set[str] = set()
+
+
+class RevocationStoreUnavailableError(RuntimeError):
+    """Raised when the persistent session revocation SQLite store is unavailable."""
 
 PUBLIC_EXACT_PATHS = {
     "/login",
@@ -177,24 +183,83 @@ def _clear_auth_attempts(bucket_key: str) -> None:
         _FAILED_LOGINS.pop(bucket_key, None)
 
 
+def _ensure_revocations_db_ready(db_path: str) -> None:
+    """Initialize WAL mode, table schema and restrictive file mode once per DB path."""
+    abs_path = os.path.abspath(db_path)
+    if abs_path in _INITIALIZED_REVOCATION_DBS and os.path.isfile(abs_path):
+        return
+    with _REVOCATION_INIT_LOCK:
+        if abs_path in _INITIALIZED_REVOCATION_DBS and os.path.isfile(abs_path):
+            return
+        os.makedirs(os.path.dirname(abs_path) or ".", exist_ok=True)
+        conn = sqlite3.connect(abs_path, timeout=5.0)
+        try:
+            conn.execute("PRAGMA busy_timeout = 5000")
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA synchronous = NORMAL")
+            conn.execute("CREATE TABLE IF NOT EXISTS revoked (sig TEXT PRIMARY KEY, expires INTEGER NOT NULL)")
+            conn.execute("CREATE INDEX IF NOT EXISTS ix_revoked_expires ON revoked (expires)")
+            conn.commit()
+        finally:
+            conn.close()
+        if os.name != "nt":
+            for suffix in ("", "-wal", "-shm"):
+                p = abs_path + suffix
+                if os.path.exists(p):
+                    try:
+                        os.chmod(p, 0o600)
+                    except OSError:
+                        pass
+        _INITIALIZED_REVOCATION_DBS.add(abs_path)
+
+
 def _revoke_session_token(token: Optional[str]) -> None:
     if not token or "." not in token:
         return
-    _, sig = token.split(".", 1)
-    if not sig:
+    b64, sig = token.split(".", 1)
+    if not b64 or len(b64) > 4096 or len(sig) != 64 or not all(c in "0123456789abcdefABCDEF" for c in sig):
         return
-    with _REVOKED_SESSION_LOCK:
-        _REVOKED_SESSION_SIGS[sig] = time.time()
-        _REVOKED_SESSION_SIGS.move_to_end(sig)
-        while len(_REVOKED_SESSION_SIGS) > MAX_REVOKED_SESSIONS:
-            _REVOKED_SESSION_SIGS.popitem(last=False)
+    try:
+        raw = base64.urlsafe_b64decode(b64 + "=" * (-len(b64) % 4))
+        expires = int(json.loads(raw.decode("utf-8")).get("exp", 0))
+    except (ValueError, TypeError, UnicodeError):
+        return
+    now_ts = int(time.time())
+    if expires < now_ts:
+        return
+    db_path = os.path.abspath(_REVOKED_SESSIONS_DB)
+    try:
+        _ensure_revocations_db_ready(db_path)
+        conn = sqlite3.connect(db_path, timeout=5.0)
+        try:
+            conn.execute("PRAGMA busy_timeout = 5000")
+            with conn:
+                conn.execute("INSERT OR REPLACE INTO revoked(sig, expires) VALUES (?, ?)", (sig, expires))
+                conn.execute("DELETE FROM revoked WHERE expires < ?", (now_ts,))
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError) as exc:
+        raise RevocationStoreUnavailableError("Session revocation database unavailable") from exc
 
 
 def _is_session_sig_revoked(sig: str) -> bool:
-    if not sig:
+    if not sig or len(sig) > 128:
         return False
-    with _REVOKED_SESSION_LOCK:
-        return sig in _REVOKED_SESSION_SIGS
+    db_path = os.path.abspath(_REVOKED_SESSIONS_DB)
+    try:
+        _ensure_revocations_db_ready(db_path)
+        conn = sqlite3.connect(db_path, timeout=5.0)
+        try:
+            conn.execute("PRAGMA busy_timeout = 5000")
+            row = conn.execute(
+                "SELECT 1 FROM revoked WHERE sig = ? AND expires >= ? LIMIT 1",
+                (sig, int(time.time())),
+            ).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError) as exc:
+        raise RevocationStoreUnavailableError("Session revocation database unavailable") from exc
 
 
 def generate_api_key() -> str:
@@ -299,10 +364,11 @@ def verify_session_token(token: Optional[str], user: User) -> bool:
         return False
     try:
         b64, sig = token.split(".", 1)
-        if _is_session_sig_revoked(sig):
-            return False
         expected_sig = hmac.new(_signing_key(user), b64.encode("ascii"), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(sig, expected_sig):
+            return False
+        # Avoid an SQLite lookup for each invalid, unsigned cookie.
+        if _is_session_sig_revoked(sig):
             return False
         pad = "=" * (-len(b64) % 4)
         data = json.loads(base64.urlsafe_b64decode(b64 + pad).decode("utf-8"))
@@ -311,6 +377,8 @@ def verify_session_token(token: Optional[str], user: User) -> bool:
         if int(data.get("uid", -1)) != user.id:
             return False
         return True
+    except RevocationStoreUnavailableError:
+        raise
     except Exception:
         return False
 
@@ -827,7 +895,16 @@ def register_auth_middleware_and_routes(app: FastAPI) -> None:
                     )
             return await _finish(await call_next(request))
 
-        authed, auth_type = check_request_auth(request)
+        try:
+            authed, auth_type = check_request_auth(request)
+        except RevocationStoreUnavailableError:
+            return await _finish(
+                JSONResponse(
+                    status_code=503,
+                    content={"detail": "会话状态存储暂时不可用，请稍后重试"},
+                    headers={"Retry-After": "3"},
+                )
+            )
         if authed:
             request.state.auth_type = auth_type
             if auth_type == "api_key" and not _is_api_key_path_allowed(path, request.method):
@@ -882,7 +959,14 @@ def register_auth_middleware_and_routes(app: FastAPI) -> None:
 
     @app.get("/login", include_in_schema=False)
     def login_page(request: Request, next: Optional[str] = None):
-        authed, _ = check_request_auth(request)
+        try:
+            authed, _ = check_request_auth(request)
+        except RevocationStoreUnavailableError:
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "会话状态存储暂时不可用，请稍后重试"},
+                headers={"Retry-After": "3"},
+            )
         edition, variants = get_active_ui_prefs()
         target = safe_next_url(next, fallback=f"/{edition}/")
         if authed:
@@ -952,7 +1036,14 @@ def register_auth_middleware_and_routes(app: FastAPI) -> None:
     def api_logout(request: Request):
         cookie_val = request.cookies.get(COOKIE_NAME)
         if cookie_val:
-            _revoke_session_token(cookie_val)
+            try:
+                _revoke_session_token(cookie_val)
+            except RevocationStoreUnavailableError:
+                return JSONResponse(
+                    status_code=503,
+                    content={"detail": "会话状态存储暂时不可用，请稍后重试"},
+                    headers={"Retry-After": "3"},
+                )
         resp = JSONResponse({"status": "logged_out"})
         resp.delete_cookie(
             key=COOKIE_NAME,
@@ -1013,8 +1104,8 @@ def register_auth_middleware_and_routes(app: FastAPI) -> None:
             db.refresh(user)
             new_token = create_session_token(user, ttl_seconds=30 * 86400)
 
-        with _REVOKED_SESSION_LOCK:
-            _REVOKED_SESSION_SIGS.clear()
+        # Rotating the signing key already invalidates every prior session.
+        # Keep persisted revocations until their TTL expires.
 
         cred_file = os.path.join(DATA_DIR, ".initial_admin_credentials")
         try:

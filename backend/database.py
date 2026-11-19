@@ -5,7 +5,7 @@ import json
 import os
 import secrets
 from cryptography.fernet import Fernet
-from sqlalchemy import create_engine, Column, Integer, String, Text, Boolean, DateTime, ForeignKey, text, event
+from sqlalchemy import create_engine, Column, Integer, String, Text, Boolean, DateTime, ForeignKey, UniqueConstraint, text, event
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -24,7 +24,13 @@ DATABASE_URL = os.environ.get("PRISM_DATABASE_URL") or f"sqlite:///{_DEFAULT_DB_
 
 SECRET_PREFIX = "enc:v1:"
 
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {})
+if DATABASE_URL.startswith("sqlite"):
+    _sqlite_kwargs = {"connect_args": {"check_same_thread": False, "timeout": 15}}
+    if ":memory:" not in DATABASE_URL and DATABASE_URL != "sqlite://":
+        _sqlite_kwargs.update(pool_size=20, max_overflow=40)
+    engine = create_engine(DATABASE_URL, **_sqlite_kwargs)
+else:
+    engine = create_engine(DATABASE_URL)
 
 
 @event.listens_for(engine, "connect")
@@ -207,6 +213,8 @@ class Mailbox(Base):
     smtp_port = Column(Integer, default=465)
     auth_password = Column(Text, default="")
     sync_status = Column(String(100), default="ok")
+    imap_uidvalidity = Column(String(50), default="")
+    imap_backfill_cursor = Column(Integer, default=0)
     last_synced_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
@@ -224,6 +232,9 @@ class Mailbox(Base):
 class Mail(Base):
     """邮件数据表"""
     __tablename__ = "mails"
+    __table_args__ = (
+        UniqueConstraint("mailbox_id", "maildir_key", name="uq_mails_mailbox_maildir_key"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     mailbox_id = Column(Integer, ForeignKey("mailboxes.id"), index=True)
@@ -247,6 +258,7 @@ class Mail(Base):
     message_id = Column(String(255), index=True, nullable=True)
     ai_summary_json = Column(Text, default="")
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+    received_at = Column(DateTime, index=True, nullable=True)
 
     mailbox = relationship("Mailbox", back_populates="mails")
 
@@ -274,6 +286,12 @@ class Mail(Base):
     @ai_summary.setter
     def ai_summary(self, val):
         self.ai_summary_json = json.dumps(val, ensure_ascii=False) if val else ""
+
+
+@event.listens_for(Mail, "before_insert")
+def _default_mail_received_at(mapper, connection, target):
+    if target.received_at is None:
+        target.received_at = target.created_at or datetime.now(timezone.utc).replace(tzinfo=None)
 
 class Tag(Base):
     """邮件维度的分类标签"""
@@ -320,14 +338,21 @@ def init_db():
             "ALTER TABLE mailboxes ADD COLUMN smtp_port INTEGER DEFAULT 465",
             "ALTER TABLE mailboxes ADD COLUMN auth_password VARCHAR(255) DEFAULT ''",
             "ALTER TABLE mailboxes ADD COLUMN sync_status VARCHAR(100) DEFAULT 'ok'",
+            "ALTER TABLE mailboxes ADD COLUMN imap_uidvalidity VARCHAR(50) DEFAULT ''",
+            "ALTER TABLE mailboxes ADD COLUMN imap_backfill_cursor INTEGER DEFAULT 0",
             "ALTER TABLE mailboxes ADD COLUMN last_synced_at DATETIME",
             "ALTER TABLE mails ADD COLUMN is_deleted BOOLEAN DEFAULT 0",
             "ALTER TABLE mails ADD COLUMN maildir_key VARCHAR(255)",
             "ALTER TABLE mails ADD COLUMN maildir_path VARCHAR(500)",
             "ALTER TABLE mails ADD COLUMN message_id VARCHAR(255)",
             "ALTER TABLE mails ADD COLUMN ai_summary_json TEXT DEFAULT ''",
+            "ALTER TABLE mails ADD COLUMN received_at DATETIME",
             "CREATE INDEX IF NOT EXISTS ix_mails_maildir_key ON mails (maildir_key)",
             "CREATE INDEX IF NOT EXISTS ix_mails_message_id ON mails (message_id)",
+            "CREATE INDEX IF NOT EXISTS ix_mails_received_at ON mails (received_at)",
+            "UPDATE mails SET received_at = created_at WHERE received_at IS NULL",
+            "DELETE FROM mails WHERE maildir_key IS NOT NULL AND id NOT IN (SELECT MIN(id) FROM mails WHERE maildir_key IS NOT NULL GROUP BY mailbox_id, maildir_key)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_mails_mailbox_maildir_key ON mails (mailbox_id, maildir_key)",
         ]:
             try:
                 conn.execute(text(col_stmt))
