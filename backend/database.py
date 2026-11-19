@@ -2,10 +2,11 @@ import base64
 from datetime import datetime, timezone
 import hashlib
 import json
+import logging
 import os
 import secrets
 from cryptography.fernet import Fernet
-from sqlalchemy import create_engine, Column, Integer, String, Text, Boolean, DateTime, ForeignKey, UniqueConstraint, text, event
+from sqlalchemy import create_engine, Column, Integer, String, Text, Boolean, DateTime, ForeignKey, UniqueConstraint, inspect, text, event
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -304,64 +305,125 @@ class Tag(Base):
 
     user = relationship("User", back_populates="tags")
 
-def init_db():
-    Base.metadata.create_all(bind=engine)
-    if DATABASE_URL.startswith("sqlite:///"):
-        db_file = DATABASE_URL[len("sqlite:///"):]
-        if db_file and os.path.isfile(db_file):
-            try:
-                os.chmod(db_file, 0o600)
-            except Exception:
-                pass
-    # Safe auto-migration for existing SQLite database
-    with engine.connect() as conn:
-        for col_stmt in [
-            "ALTER TABLE users ADD COLUMN sidebar_grouping_mode VARCHAR(30) DEFAULT 'tags'",
-            "ALTER TABLE users ADD COLUMN settings_json TEXT DEFAULT '{}'",
-            "ALTER TABLE users ADD COLUMN password_hash VARCHAR(255) DEFAULT ''",
-            "ALTER TABLE users ADD COLUMN session_secret VARCHAR(128) DEFAULT ''",
-            "ALTER TABLE users ADD COLUMN api_key VARCHAR(128) DEFAULT ''",
-            "ALTER TABLE mailbox_groups ADD COLUMN description VARCHAR(200) DEFAULT ''",
-            "ALTER TABLE mailbox_groups ADD COLUMN icon VARCHAR(30) DEFAULT 'Folder'",
-            "ALTER TABLE mailbox_groups ADD COLUMN color VARCHAR(20) DEFAULT '#6366f1'",
-            "ALTER TABLE mailbox_groups ADD COLUMN sort_order INTEGER DEFAULT 0",
-            "ALTER TABLE mailbox_groups ADD COLUMN created_at DATETIME",
-            "ALTER TABLE mailboxes ADD COLUMN group_id INTEGER REFERENCES mailbox_groups(id)",
-            "ALTER TABLE mailboxes ADD COLUMN role VARCHAR(30) DEFAULT 'personal'",
-            "ALTER TABLE mailboxes ADD COLUMN is_vip BOOLEAN DEFAULT 0",
-            "ALTER TABLE domains ADD COLUMN is_external BOOLEAN DEFAULT 0",
-            "ALTER TABLE mailboxes ADD COLUMN is_external BOOLEAN DEFAULT 0",
-            "ALTER TABLE mailboxes ADD COLUMN provider VARCHAR(50) DEFAULT 'local'",
-            "ALTER TABLE mailboxes ADD COLUMN imap_host VARCHAR(150) DEFAULT ''",
-            "ALTER TABLE mailboxes ADD COLUMN imap_port INTEGER DEFAULT 993",
-            "ALTER TABLE mailboxes ADD COLUMN smtp_host VARCHAR(150) DEFAULT ''",
-            "ALTER TABLE mailboxes ADD COLUMN smtp_port INTEGER DEFAULT 465",
-            "ALTER TABLE mailboxes ADD COLUMN auth_password VARCHAR(255) DEFAULT ''",
-            "ALTER TABLE mailboxes ADD COLUMN sync_status VARCHAR(100) DEFAULT 'ok'",
-            "ALTER TABLE mailboxes ADD COLUMN imap_uidvalidity VARCHAR(50) DEFAULT ''",
-            "ALTER TABLE mailboxes ADD COLUMN imap_backfill_cursor INTEGER DEFAULT 0",
-            "ALTER TABLE mailboxes ADD COLUMN last_synced_at DATETIME",
-            "ALTER TABLE mails ADD COLUMN is_deleted BOOLEAN DEFAULT 0",
-            "ALTER TABLE mails ADD COLUMN maildir_key VARCHAR(255)",
-            "ALTER TABLE mails ADD COLUMN maildir_path VARCHAR(500)",
-            "ALTER TABLE mails ADD COLUMN message_id VARCHAR(255)",
-            "ALTER TABLE mails ADD COLUMN ai_summary_json TEXT DEFAULT ''",
-            "ALTER TABLE mails ADD COLUMN received_at DATETIME",
-            "CREATE INDEX IF NOT EXISTS ix_mails_maildir_key ON mails (maildir_key)",
-            "CREATE INDEX IF NOT EXISTS ix_mails_message_id ON mails (message_id)",
-            "CREATE INDEX IF NOT EXISTS ix_mails_received_at ON mails (received_at)",
-            "UPDATE mails SET received_at = created_at WHERE received_at IS NULL",
-            "DELETE FROM mails WHERE maildir_key IS NOT NULL AND id NOT IN (SELECT MIN(id) FROM mails WHERE maildir_key IS NOT NULL GROUP BY mailbox_id, maildir_key)",
-            "CREATE UNIQUE INDEX IF NOT EXISTS uq_mails_mailbox_maildir_key ON mails (mailbox_id, maildir_key)",
-        ]:
-            try:
-                conn.execute(text(col_stmt))
-                conn.commit()
-            except Exception:
-                pass
+_mig_logger = logging.getLogger("prism_mail.migration")
+
+_COLUMN_MIGRATIONS = [
+    ("users", "sidebar_grouping_mode", "ALTER TABLE users ADD COLUMN sidebar_grouping_mode VARCHAR(30) DEFAULT 'tags'"),
+    ("users", "settings_json", "ALTER TABLE users ADD COLUMN settings_json TEXT DEFAULT '{}'"),
+    ("users", "password_hash", "ALTER TABLE users ADD COLUMN password_hash VARCHAR(255) DEFAULT ''"),
+    ("users", "session_secret", "ALTER TABLE users ADD COLUMN session_secret VARCHAR(128) DEFAULT ''"),
+    ("users", "api_key", "ALTER TABLE users ADD COLUMN api_key VARCHAR(128) DEFAULT ''"),
+    ("mailbox_groups", "description", "ALTER TABLE mailbox_groups ADD COLUMN description VARCHAR(200) DEFAULT ''"),
+    ("mailbox_groups", "icon", "ALTER TABLE mailbox_groups ADD COLUMN icon VARCHAR(30) DEFAULT 'Folder'"),
+    ("mailbox_groups", "color", "ALTER TABLE mailbox_groups ADD COLUMN color VARCHAR(20) DEFAULT '#6366f1'"),
+    ("mailbox_groups", "sort_order", "ALTER TABLE mailbox_groups ADD COLUMN sort_order INTEGER DEFAULT 0"),
+    ("mailbox_groups", "created_at", "ALTER TABLE mailbox_groups ADD COLUMN created_at DATETIME"),
+    ("mailboxes", "group_id", "ALTER TABLE mailboxes ADD COLUMN group_id INTEGER REFERENCES mailbox_groups(id)"),
+    ("mailboxes", "role", "ALTER TABLE mailboxes ADD COLUMN role VARCHAR(30) DEFAULT 'personal'"),
+    ("mailboxes", "is_vip", "ALTER TABLE mailboxes ADD COLUMN is_vip BOOLEAN DEFAULT 0"),
+    ("domains", "is_external", "ALTER TABLE domains ADD COLUMN is_external BOOLEAN DEFAULT 0"),
+    ("mailboxes", "is_external", "ALTER TABLE mailboxes ADD COLUMN is_external BOOLEAN DEFAULT 0"),
+    ("mailboxes", "provider", "ALTER TABLE mailboxes ADD COLUMN provider VARCHAR(50) DEFAULT 'local'"),
+    ("mailboxes", "imap_host", "ALTER TABLE mailboxes ADD COLUMN imap_host VARCHAR(150) DEFAULT ''"),
+    ("mailboxes", "imap_port", "ALTER TABLE mailboxes ADD COLUMN imap_port INTEGER DEFAULT 993"),
+    ("mailboxes", "smtp_host", "ALTER TABLE mailboxes ADD COLUMN smtp_host VARCHAR(150) DEFAULT ''"),
+    ("mailboxes", "smtp_port", "ALTER TABLE mailboxes ADD COLUMN smtp_port INTEGER DEFAULT 465"),
+    ("mailboxes", "auth_password", "ALTER TABLE mailboxes ADD COLUMN auth_password VARCHAR(255) DEFAULT ''"),
+    ("mailboxes", "sync_status", "ALTER TABLE mailboxes ADD COLUMN sync_status VARCHAR(100) DEFAULT 'ok'"),
+    ("mailboxes", "imap_uidvalidity", "ALTER TABLE mailboxes ADD COLUMN imap_uidvalidity VARCHAR(50) DEFAULT ''"),
+    ("mailboxes", "imap_backfill_cursor", "ALTER TABLE mailboxes ADD COLUMN imap_backfill_cursor INTEGER DEFAULT 0"),
+    ("mailboxes", "last_synced_at", "ALTER TABLE mailboxes ADD COLUMN last_synced_at DATETIME"),
+    ("mails", "is_deleted", "ALTER TABLE mails ADD COLUMN is_deleted BOOLEAN DEFAULT 0"),
+    ("mails", "maildir_key", "ALTER TABLE mails ADD COLUMN maildir_key VARCHAR(255)"),
+    ("mails", "maildir_path", "ALTER TABLE mails ADD COLUMN maildir_path VARCHAR(500)"),
+    ("mails", "message_id", "ALTER TABLE mails ADD COLUMN message_id VARCHAR(255)"),
+    ("mails", "ai_summary_json", "ALTER TABLE mails ADD COLUMN ai_summary_json TEXT DEFAULT ''"),
+    ("mails", "received_at", "ALTER TABLE mails ADD COLUMN received_at DATETIME"),
+]
+
+
+def _table_names(conn, dialect_name: str) -> set[str]:
+    if dialect_name == "sqlite":
+        rows = conn.execute(text("SELECT name FROM sqlite_master WHERE type='table'")).fetchall()
+        return {r[0] for r in rows}
+    return set(inspect(conn).get_table_names())
+
+
+def _table_columns(conn, dialect_name: str, table_name: str) -> set[str]:
+    if dialect_name == "sqlite":
+        rows = conn.execute(text(f'PRAGMA table_info("{table_name}")')).fetchall()
+        return {r[1] for r in rows}
+    return {col["name"] for col in inspect(conn).get_columns(table_name)}
+
+
+def run_migrations_on_engine(target_engine) -> None:
+    """Apply non-destructive schema migrations and conflict-preserving deduplication."""
+    dialect_name = target_engine.dialect.name
+    with target_engine.connect() as conn:
+        existing_tables = _table_names(conn, dialect_name)
+        cols_cache: dict[str, set[str]] = {}
+        for table_name, col_name, alter_sql in _COLUMN_MIGRATIONS:
+            if table_name not in existing_tables:
+                continue
+            if table_name not in cols_cache:
+                cols_cache[table_name] = _table_columns(conn, dialect_name, table_name)
+            if col_name not in cols_cache[table_name]:
+                conn.execute(text(alter_sql))
+                cols_cache[table_name].add(col_name)
+        conn.commit()
+
+        if "mails" in existing_tables:
+            conn.execute(text("UPDATE mails SET received_at = COALESCE(created_at, CURRENT_TIMESTAMP) WHERE received_at IS NULL"))
+            dups = conn.execute(text(
+                "SELECT id, mailbox_id, maildir_key FROM mails "
+                "WHERE maildir_key IS NOT NULL AND id NOT IN ("
+                "  SELECT MIN(id) FROM mails WHERE maildir_key IS NOT NULL GROUP BY mailbox_id, maildir_key"
+                ") ORDER BY id ASC"
+            )).fetchall()
+            if dups:
+                conn.execute(text(
+                    "CREATE TABLE IF NOT EXISTS migration_conflict_audit ("
+                    "  id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "  mail_id INTEGER NOT NULL, "
+                    "  mailbox_id INTEGER, "
+                    "  original_maildir_key TEXT NOT NULL, "
+                    "  renamed_maildir_key TEXT NOT NULL, "
+                    "  migrated_at TEXT NOT NULL"
+                    ")"
+                ))
+                now_iso = datetime.now(timezone.utc).isoformat()
+                for mail_id, mb_id, orig_key in dups:
+                    suffix = f"#conflict#{mail_id}"
+                    renamed_key = f"{str(orig_key)[:255 - len(suffix)]}{suffix}"
+                    conn.execute(
+                        text("UPDATE mails SET maildir_key = :renamed WHERE id = :id"),
+                        {"renamed": renamed_key, "id": mail_id},
+                    )
+                    conn.execute(
+                        text(
+                            "INSERT INTO migration_conflict_audit "
+                            "(mail_id, mailbox_id, original_maildir_key, renamed_maildir_key, migrated_at) "
+                            "VALUES (:mid, :mbid, :orig, :renamed, :ts)"
+                        ),
+                        {"mid": mail_id, "mbid": mb_id, "orig": str(orig_key), "renamed": renamed_key, "ts": now_iso},
+                    )
+                    _mig_logger.warning(
+                        "Preserved duplicate mail row id=%s (mailbox_id=%s) by renaming maildir_key %r -> %r",
+                        mail_id, mb_id, orig_key, renamed_key,
+                    )
+
+            for idx_stmt in [
+                "CREATE INDEX IF NOT EXISTS ix_mails_maildir_key ON mails (maildir_key)",
+                "CREATE INDEX IF NOT EXISTS ix_mails_message_id ON mails (message_id)",
+                "CREATE INDEX IF NOT EXISTS ix_mails_received_at ON mails (received_at)",
+                "CREATE INDEX IF NOT EXISTS ix_mails_mb_folder_received ON mails (mailbox_id, folder, is_deleted, received_at)",
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_mails_mailbox_maildir_key ON mails (mailbox_id, maildir_key)",
+            ]:
+                conn.execute(text(idx_stmt))
+            conn.commit()
 
         # Data migration: If mailbox_labels is empty, migrate from mailbox_groups
-        try:
+        if {"mailbox_labels", "mailbox_groups", "mailboxes", "mailbox_label_mappings"} <= existing_tables:
             res = conn.execute(text("SELECT count(*) FROM mailbox_labels")).fetchone()
             if res and res[0] == 0:
                 groups = conn.execute(text("SELECT id, user_id, name, description, icon, color, sort_order FROM mailbox_groups")).fetchall()
@@ -378,11 +440,9 @@ def init_db():
                         "VALUES (:mb_id, :lbl_id, datetime('now'))"
                     ), {"mb_id": mb_id, "lbl_id": grp_id})
                 conn.commit()
-        except Exception:
-            pass
 
         # Encrypt legacy plaintext external mailbox passwords in place
-        try:
+        if "mailboxes" in existing_tables:
             rows = conn.execute(
                 text("SELECT id, auth_password FROM mailboxes WHERE auth_password IS NOT NULL AND auth_password != ''")
             ).fetchall()
@@ -396,5 +456,15 @@ def init_db():
                     migrated = True
             if migrated:
                 conn.commit()
-        except Exception:
-            pass
+
+
+def init_db():
+    Base.metadata.create_all(bind=engine)
+    if DATABASE_URL.startswith("sqlite:///"):
+        db_file = DATABASE_URL[len("sqlite:///"):]
+        if db_file and os.path.isfile(db_file):
+            try:
+                os.chmod(db_file, 0o600)
+            except OSError:
+                pass
+    run_migrations_on_engine(engine)

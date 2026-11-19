@@ -13,6 +13,7 @@ import json
 import mimetypes
 import os
 import re
+import secrets
 import shutil
 import smtplib
 import socket
@@ -34,7 +35,7 @@ from fastapi.responses import FileResponse, RedirectResponse, Response
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy import or_, func
+from sqlalchemy import or_
 
 from database import (
     DATA_DIR, SessionLocal, init_db, User, Domain, Mailbox,
@@ -708,10 +709,20 @@ def _upgrade_legacy_dovecot_passwords() -> None:
         print(f"upgrade_legacy_dovecot_passwords notice: {e}")
 
 
-def ensure_system_domain(domain_name: str):
+class SystemProvisioningError(RuntimeError):
+    """Raised when Maildir / Postfix / Dovecot provisioning or archival fails."""
+
+
+def ensure_system_domain(domain_name: str, strict: bool = False):
     """Ensure domain directory exists in /var/vmail and domain is registered in Postfix virtual_mailbox_domains."""
-    domain_name = domain_name.strip().lower()
-    if not domain_name or not DOMAIN_RE.match(domain_name) or not os.path.exists(VMAIL_DIR):
+    domain_name = (domain_name or "").strip().lower()
+    if not domain_name or not DOMAIN_RE.match(domain_name):
+        if strict:
+            raise SystemProvisioningError(f"无效的系统域名: {domain_name!r}")
+        return
+    if not os.path.isdir(VMAIL_DIR):
+        if strict and os.environ.get("PRISM_DEV_ALLOW_NO_VMAIL", "").strip() != "1":
+            raise SystemProvisioningError(f"邮件存储根目录不可用: {VMAIL_DIR}")
         return
     try:
         with _provisioning_lock:
@@ -725,34 +736,42 @@ def ensure_system_domain(domain_name: str):
                 if domain_name not in domains:
                     domains.append(domain_name)
                     new_val = ", ".join(domains)
-                    subprocess.run(["postconf", "-e", f"virtual_mailbox_domains = {new_val}"], check=False)
+                    subprocess.run(["postconf", "-e", f"virtual_mailbox_domains = {new_val}"], check=True)
                     if shutil.which("postfix"):
-                        subprocess.run(["postfix", "reload"], check=False)
+                        subprocess.run(["postfix", "reload"], check=True)
     except Exception as e:
+        if strict:
+            raise SystemProvisioningError(f"系统域名配置失败 ({domain_name}): {e}") from e
         print(f"ensure_system_domain notice ({domain_name}): {e}")
 
 
-def provision_system_mailbox(domain_name: str, prefix: str):
+def provision_system_mailbox(domain_name: str, prefix: str, strict: bool = False):
     """Ensure Maildir, /etc/postfix/vmailbox, and /etc/dovecot/users have this mailbox configured."""
-    domain_name = domain_name.strip().lower()
-    prefix = prefix.strip().lower()
+    domain_name = (domain_name or "").strip().lower()
+    prefix = (prefix or "").strip().lower()
     if (
         not DOMAIN_RE.match(domain_name)
         or ".." in prefix
         or not MAILBOX_PREFIX_RE.match(prefix)
     ):
+        if strict:
+            raise SystemProvisioningError(f"无效的系统邮箱参数: {prefix}@{domain_name}")
         return
     full_address = f"{prefix}@{domain_name}"
-    if not os.path.exists(VMAIL_DIR):
+    if not os.path.isdir(VMAIL_DIR):
+        if strict and os.environ.get("PRISM_DEV_ALLOW_NO_VMAIL", "").strip() != "1":
+            raise SystemProvisioningError(f"邮件存储根目录不可用: {VMAIL_DIR}")
         return
 
     try:
         with _provisioning_lock:
-            ensure_system_domain(domain_name)
+            ensure_system_domain(domain_name, strict=strict)
             mb_root = _safe_vmail_path(domain_name, prefix)
             target_maildir = _safe_vmail_path(domain_name, prefix, "Maildir")
             for sub in ("cur", "new", "tmp"):
                 os.makedirs(os.path.join(target_maildir, sub), exist_ok=True)
+            if not all(os.path.isdir(os.path.join(target_maildir, sub)) for sub in ("cur", "new", "tmp")):
+                raise SystemProvisioningError(f"Maildir 目录初始化校验失败: {target_maildir}")
             _safe_chown_vmail(mb_root)
 
             # 1. Ensure /etc/postfix/vmailbox entry
@@ -765,9 +784,9 @@ def provision_system_mailbox(domain_name: str, prefix: str):
                     new_content = f"{vmb_content}{sep}{full_address} {domain_name}/{prefix}/Maildir/\n"
                     _atomic_write_text(POSTFIX_VMAILBOX, new_content, mode=0o644)
                     if shutil.which("postmap"):
-                        subprocess.run(["postmap", POSTFIX_VMAILBOX], check=False)
+                        subprocess.run(["postmap", POSTFIX_VMAILBOX], check=True)
                     if shutil.which("postfix"):
-                        subprocess.run(["postfix", "reload"], check=False)
+                        subprocess.run(["postfix", "reload"], check=True)
 
             # 2. Ensure /etc/dovecot/users entry (Critical for Dovecot LMTP delivery, password login locked)
             if os.path.exists(DOVECOT_USERS):
@@ -779,22 +798,31 @@ def provision_system_mailbox(domain_name: str, prefix: str):
                     vmail_base = VMAIL_DIR.rstrip("/\\")
                     user_line = f"{full_address}:!:5000:5000::{vmail_base}/{domain_name}/{prefix}::\n"
                     _atomic_write_text(DOVECOT_USERS, f"{dovecot_content}{sep}{user_line}", mode=0o640)
+    except SystemProvisioningError:
+        if strict:
+            raise
     except Exception as e:
+        if strict:
+            raise SystemProvisioningError(f"系统邮箱开通失败 ({full_address}): {e}") from e
         print(f"provision_system_mailbox notice ({full_address}): {e}")
 
 
-def deprovision_system_mailbox(domain_name: str, prefix: str):
+def deprovision_system_mailbox(domain_name: str, prefix: str, strict: bool = False):
     """Remove mailbox from Postfix, Dovecot, and archive its Maildir so sync does not resurrect it."""
-    domain_name = domain_name.strip().lower()
-    prefix = prefix.strip().lower()
+    domain_name = (domain_name or "").strip().lower()
+    prefix = (prefix or "").strip().lower()
     if (
         not DOMAIN_RE.match(domain_name)
         or ".." in prefix
         or not MAILBOX_PREFIX_RE.match(prefix)
     ):
+        if strict:
+            raise SystemProvisioningError(f"无效的系统邮箱参数: {prefix}@{domain_name}")
         return
     full_address = f"{prefix}@{domain_name}"
-    if not os.path.exists(VMAIL_DIR):
+    if not os.path.isdir(VMAIL_DIR):
+        if strict and os.environ.get("PRISM_DEV_ALLOW_NO_VMAIL", "").strip() != "1":
+            raise SystemProvisioningError(f"邮件存储根目录不可用: {VMAIL_DIR}")
         return
 
     try:
@@ -807,9 +835,9 @@ def deprovision_system_mailbox(domain_name: str, prefix: str):
                 if len(new_lines) != len(lines):
                     _atomic_write_text(POSTFIX_VMAILBOX, "".join(new_lines), mode=0o644)
                     if shutil.which("postmap"):
-                        subprocess.run(["postmap", POSTFIX_VMAILBOX], check=False)
+                        subprocess.run(["postmap", POSTFIX_VMAILBOX], check=True)
                     if shutil.which("postfix"):
-                        subprocess.run(["postfix", "reload"], check=False)
+                        subprocess.run(["postfix", "reload"], check=True)
 
             # 2. Remove from /etc/dovecot/users
             if os.path.exists(DOVECOT_USERS):
@@ -824,10 +852,53 @@ def deprovision_system_mailbox(domain_name: str, prefix: str):
             if os.path.exists(mb_dir):
                 trash_root = _safe_vmail_path(".trash")
                 os.makedirs(trash_root, exist_ok=True)
-                dest = _safe_vmail_path(".trash", f"{domain_name}_{prefix}_{int(time.time())}")
+                dest = _safe_vmail_path(".trash", f"{domain_name}_{prefix}_{int(time.time())}_{secrets.token_hex(3)}")
                 shutil.move(mb_dir, dest)
+                if os.path.exists(mb_dir):
+                    raise SystemProvisioningError(f"残留邮箱目录未被移出: {mb_dir}")
+    except SystemProvisioningError:
+        if strict:
+            raise
     except Exception as e:
+        if strict:
+            raise SystemProvisioningError(f"系统邮箱停用失败 ({full_address}): {e}") from e
         print(f"deprovision_system_mailbox notice ({full_address}): {e}")
+
+
+def deprovision_system_domain(domain_name: str, strict: bool = False):
+    """Archive empty domain dir in VMAIL_DIR and unregister it from Postfix virtual_mailbox_domains."""
+    domain_name = (domain_name or "").strip().lower()
+    if not domain_name or not DOMAIN_RE.match(domain_name):
+        if strict:
+            raise SystemProvisioningError(f"无效的系统域名: {domain_name!r}")
+        return
+    if not os.path.isdir(VMAIL_DIR):
+        return
+    try:
+        with _provisioning_lock:
+            if shutil.which("postconf"):
+                out = subprocess.check_output(["postconf", "-h", "virtual_mailbox_domains"], text=True).strip()
+                domains = [d.strip() for d in re.split(r"[\s,]+", out) if d.strip()]
+                if domain_name in domains:
+                    remaining = [d for d in domains if d != domain_name]
+                    subprocess.run(["postconf", "-e", f"virtual_mailbox_domains = {', '.join(remaining)}"], check=True)
+                    if shutil.which("postfix"):
+                        subprocess.run(["postfix", "reload"], check=True)
+            domain_dir = _safe_vmail_path(domain_name)
+            if os.path.exists(domain_dir):
+                trash_root = _safe_vmail_path(".trash")
+                os.makedirs(trash_root, exist_ok=True)
+                dest = _safe_vmail_path(".trash", f"{domain_name}_domain_{int(time.time())}_{secrets.token_hex(3)}")
+                shutil.move(domain_dir, dest)
+                if os.path.exists(domain_dir):
+                    raise SystemProvisioningError(f"残留域名目录未被移出: {domain_dir}")
+    except SystemProvisioningError:
+        if strict:
+            raise
+    except Exception as e:
+        if strict:
+            raise SystemProvisioningError(f"系统域名停用失败 ({domain_name}): {e}") from e
+        print(f"deprovision_system_domain notice ({domain_name}): {e}")
 
 # ----------------- REAL MAILDIR SYNCHRONIZER -----------------
 _sync_lock = threading.Lock()
@@ -1731,10 +1802,12 @@ def sync_single_external_mailbox(
                 backfill_selected = list(backfill_slice)
 
             completed_uids: set[str] = set()
+            failed_uids: List[str] = []
             for uid_str in selected_uids:
                 try:
                     typ, fetch_data = imap.uid("fetch", uid_str, "(BODY.PEEK[] FLAGS INTERNALDATE)")
                     if typ != "OK" or not fetch_data:
+                        failed_uids.append(uid_str)
                         continue
 
                     raw_bytes = None
@@ -1818,6 +1891,7 @@ def sync_single_external_mailbox(
                         db.rollback()
                     completed_uids.add(uid_str)
                 except Exception as inner_e:
+                    failed_uids.append(uid_str)
                     print(f"IMAP fetch UID {uid_str} notice ({mb.address}): {inner_e}")
 
             backfill_completed = [int(u) for u in backfill_selected if u in completed_uids]
@@ -1827,7 +1901,11 @@ def sync_single_external_mailbox(
                 else:
                     mb.imap_backfill_cursor = max(backfill_completed)
 
-            mb.sync_status = "ok"
+            if failed_uids:
+                sample_failed = ", ".join(failed_uids[:3])
+                mb.sync_status = f"partial_error: {len(failed_uids)}/{len(selected_uids)} failed (UID {sample_failed})"[:100]
+            else:
+                mb.sync_status = "ok"
             mb.last_synced_at = datetime.now(timezone.utc).replace(tzinfo=None)
             db.commit()
             _ext_mb_last_sync_ts[mb.id] = time.time()
@@ -2132,8 +2210,7 @@ def create_domain(payload: DomainCreate, db: Session = Depends(get_db)):
         spf_record=f"v=spf1 include:_spf.{name} ~all"
     )
     db.add(domain)
-    db.commit()
-    db.refresh(domain)
+    db.flush()
 
     # Automatically create default admin mailbox
     default_mb = Mailbox(
@@ -2146,10 +2223,17 @@ def create_domain(payload: DomainCreate, db: Session = Depends(get_db)):
         is_vip=True
     )
     db.add(default_mb)
-    db.commit()
+    db.flush()
 
-    # Provision in Postfix & Dovecot
-    provision_system_mailbox(name, "admin")
+    # Provision in Maildir + Postfix + Dovecot before committing DB state
+    try:
+        provision_system_mailbox(name, "admin", strict=True)
+    except SystemProvisioningError as exc:
+        db.rollback()
+        deprovision_system_domain(name, strict=False)
+        raise HTTPException(status_code=500, detail=f"系统域名邮箱开通失败: {exc}")
+    db.commit()
+    db.refresh(domain)
 
     return {
         "status": "success",
@@ -2175,13 +2259,17 @@ def delete_domain(domain_id: int, db: Session = Depends(get_db)):
     if not d:
         raise HTTPException(status_code=404, detail="Domain not found")
     mb_list = list(d.mailboxes)
+    if not getattr(d, "is_external", False):
+        try:
+            for mb in mb_list:
+                if not mb.is_external:
+                    deprovision_system_mailbox(d.name, mb.prefix, strict=True)
+            deprovision_system_domain(d.name, strict=True)
+        except SystemProvisioningError as exc:
+            raise HTTPException(status_code=500, detail=f"系统域名停用失败: {exc}")
     mb_ids = [mb.id for mb in mb_list]
     mails_to_clean = db.query(Mail).filter(Mail.mailbox_id.in_(mb_ids)).all() if mb_ids else []
     _cleanup_mail_cache_files(mails_to_clean, mailbox_ids=mb_ids)
-    if not getattr(d, "is_external", False):
-        for mb in mb_list:
-            if not mb.is_external:
-                deprovision_system_mailbox(d.name, mb.prefix)
     db.delete(d)
     db.commit()
     return {"status": "deleted"}
@@ -2216,17 +2304,24 @@ def create_mailbox_under_domain(domain_id: int, payload: MailboxCreate, db: Sess
         is_default=False
     )
     db.add(mb)
-    db.commit()
-    db.refresh(mb)
+    db.flush()
 
     # Ensure default label mapping if none
     lbl_core = db.query(MailboxLabel).filter(MailboxLabel.name == "核心日常与管理").first()
     if lbl_core:
         db.add(MailboxLabelMapping(mailbox_id=mb.id, label_id=lbl_core.id))
-        db.commit()
+        db.flush()
 
-    # Provision in Maildir + Postfix + Dovecot
-    provision_system_mailbox(domain.name, pfx)
+    # Provision in Maildir + Postfix + Dovecot before committing DB row
+    try:
+        provision_system_mailbox(domain.name, pfx, strict=True)
+    except SystemProvisioningError as exc:
+        db.rollback()
+        deprovision_system_mailbox(domain.name, pfx, strict=False)
+        raise HTTPException(status_code=500, detail=f"系统邮箱底层开通失败: {exc}")
+
+    db.commit()
+    db.refresh(mb)
 
     return {
         "id": mb.id,
@@ -2246,14 +2341,17 @@ def delete_mailbox(mailbox_id: int, db: Session = Depends(get_db)):
     domain_name = domain.name if domain else "example.com"
     pfx = mb.prefix
     is_ext = bool(mb.is_external)
+    if not is_ext:
+        try:
+            deprovision_system_mailbox(domain_name, pfx, strict=True)
+        except SystemProvisioningError as exc:
+            raise HTTPException(status_code=500, detail=f"系统邮箱停用或归档失败: {exc}")
     mails_to_clean = db.query(Mail).filter(Mail.mailbox_id == mb.id).all()
     _cleanup_mail_cache_files(mails_to_clean, mailbox_ids=[mb.id])
     db.query(MailboxLabelMapping).filter(MailboxLabelMapping.mailbox_id == mb.id).delete()
     db.delete(mb)
     db.commit()
-    if not is_ext:
-        deprovision_system_mailbox(domain_name, pfx)
-    elif domain and getattr(domain, "is_external", False) and len(domain.mailboxes) == 0:
+    if is_ext and domain and getattr(domain, "is_external", False) and len(domain.mailboxes) == 0:
         db.delete(domain)
         db.commit()
     return {"status": "deleted"}
@@ -2447,19 +2545,24 @@ def manual_sync_external_mailbox(mailbox_id: int, request: Request, db: Session 
     mb = db.query(Mailbox).filter(Mailbox.id == mailbox_id).first()
     if not mb or not mb.is_external:
         raise HTTPException(status_code=404, detail="未找到该外部邮箱")
-    _check_agent_policy(request, target_address=mb.address)
+    _check_agent_policy(request, target_address=mb.address, is_sync=True)
     new_count = sync_single_external_mailbox(db, mb, max_fetch=50)
     sync_st = str(mb.sync_status or "ok")
-    is_err = sync_st.startswith("error")
+    if sync_st.startswith("error"):
+        status_val = "error"
+    elif sync_st.startswith("partial_error"):
+        status_val = "partial_error"
+    else:
+        status_val = "ok"
     resp: Dict[str, Any] = {
-        "status": "error" if is_err else "ok",
+        "status": status_val,
         "mailbox_id": mb.id,
         "address": mb.address,
         "new_mails": new_count,
         "sync_status": sync_st,
         "last_synced_at": format_utc_iso(mb.last_synced_at) if mb.last_synced_at else None,
     }
-    if is_err:
+    if status_val != "ok":
         resp["detail"] = sync_st
     return resp
 
@@ -3781,12 +3884,19 @@ def get_agent_api_spec():
         ]
     }
 
-def _check_agent_policy(request: Request, target_address: Optional[str] = None, is_send: bool = False) -> Optional[dict]:
+def _check_agent_policy(
+    request: Request,
+    target_address: Optional[str] = None,
+    is_send: bool = False,
+    is_sync: bool = False,
+) -> Optional[dict]:
     if getattr(request.state, "auth_type", "") != "api_key":
         return None
     pol = get_agent_policy()
     if is_send and not pol.get("allow_send", True):
         raise HTTPException(status_code=403, detail="当前 API Key 策略禁止发信或写操作")
+    if is_sync and not pol.get("allow_sync", True):
+        raise HTTPException(status_code=403, detail="当前 API Key 策略禁止触发外部同步")
     allowed = pol.get("allowed_addresses") or []
     if allowed and target_address is not None:
         if target_address.strip().lower() not in allowed:
@@ -3834,13 +3944,14 @@ def agent_list_mails(
         target_domain=domain,
         allowed_addresses=allowed_addrs,
     )
-    sync_target_external_mailboxes_for_agent(
-        db,
-        mailbox_id=mailbox_id,
-        address=address,
-        domain=domain,
-        allowed_addresses=allowed_addrs,
-    )
+    if not pol or pol.get("allow_sync", True):
+        sync_target_external_mailboxes_for_agent(
+            db,
+            mailbox_id=mailbox_id,
+            address=address,
+            domain=domain,
+            allowed_addresses=allowed_addrs,
+        )
     q = db.query(Mail).filter(Mail.is_deleted == False)
 
     if folder != "all":
@@ -3920,11 +4031,12 @@ def agent_get_latest_mail_or_code(
         target_address=address,
         allowed_addresses=allowed_addrs,
     )
-    sync_target_external_mailboxes_for_agent(
-        db,
-        address=address,
-        allowed_addresses=allowed_addrs,
-    )
+    if not pol or pol.get("allow_sync", True):
+        sync_target_external_mailboxes_for_agent(
+            db,
+            address=address,
+            allowed_addresses=allowed_addrs,
+        )
     q = db.query(Mail).filter(Mail.is_deleted == False, Mail.folder == "inbox")
 
     if address:
@@ -3944,18 +4056,17 @@ def agent_get_latest_mail_or_code(
     if unread_only:
         q = q.filter(Mail.is_read == False)
 
-    effective_received = func.coalesce(Mail.received_at, Mail.created_at)
     is_code_endpoint = request.url.path.rstrip("/") == "/api/agent/code"
     effective_window = DEFAULT_AGENT_CODE_WINDOW_MINUTES if (within_minutes is None and is_code_endpoint) else within_minutes
     if effective_window is not None and effective_window > 0:
         cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=effective_window)
-        q = q.filter(effective_received >= cutoff)
+        q = q.filter(Mail.received_at >= cutoff)
 
     if is_code_endpoint:
-        # Inspect recent candidates by server reception time newest-first so future
-        # Date headers cannot poison selection and delayed delivery still stays fresh.
+        # Inspect recent candidates by server reception time newest-first using the
+        # direct Mail.received_at index so future Date headers cannot poison selection.
         m = None
-        candidates = q.order_by(effective_received.desc(), Mail.id.desc()).limit(MAX_AGENT_CODE_SCAN).all()
+        candidates = q.order_by(Mail.received_at.desc(), Mail.id.desc()).limit(MAX_AGENT_CODE_SCAN).all()
         for cand in candidates:
             if (
                 extract_verification_codes(cand.subject, cand.body_text)
@@ -3964,7 +4075,7 @@ def agent_get_latest_mail_or_code(
                 m = cand
                 break
     else:
-        m = q.order_by(effective_received.desc(), Mail.id.desc()).first()
+        m = q.order_by(Mail.received_at.desc(), Mail.id.desc()).first()
 
     if not m:
         return {"found": False, "mail": None, "verification_code": None, "verification_codes": [], "links": []}
@@ -4122,9 +4233,15 @@ def agent_send_mail(payload: AgentSendMailPayload, request: Request, db: Session
                     role="bot"
                 )
                 db.add(mailbox)
+                db.flush()
+                try:
+                    provision_system_mailbox(dom.name, pfx, strict=True)
+                except SystemProvisioningError as exc:
+                    db.rollback()
+                    deprovision_system_mailbox(dom.name, pfx, strict=False)
+                    raise HTTPException(status_code=500, detail=f"自动开通发件邮箱失败: {exc}")
                 db.commit()
                 db.refresh(mailbox)
-                provision_system_mailbox(dom.name, pfx)
     else:
         mb_q = db.query(Mailbox)
         if pol and pol.get("allowed_addresses"):
@@ -4272,7 +4389,10 @@ def agent_create_mailbox(payload: AgentMailboxCreatePayload, request: Request, d
     existing = db.query(Mailbox).filter(Mailbox.address == full_address).first()
     if existing:
         if not existing.is_external:
-            provision_system_mailbox(domain.name, pfx)
+            try:
+                provision_system_mailbox(domain.name, pfx, strict=True)
+            except SystemProvisioningError as exc:
+                raise HTTPException(status_code=500, detail=f"系统邮箱开通修复失败: {exc}")
         return {
             "status": "exists",
             "id": existing.id,
@@ -4290,15 +4410,22 @@ def agent_create_mailbox(payload: AgentMailboxCreatePayload, request: Request, d
         is_default=False
     )
     db.add(mb)
-    db.commit()
-    db.refresh(mb)
+    db.flush()
 
     lbl_ai = db.query(MailboxLabel).filter(MailboxLabel.name == "AI Agent 自动化").first()
     if lbl_ai:
         db.add(MailboxLabelMapping(mailbox_id=mb.id, label_id=lbl_ai.id))
-        db.commit()
+        db.flush()
 
-    provision_system_mailbox(domain.name, pfx)
+    try:
+        provision_system_mailbox(domain.name, pfx, strict=True)
+    except SystemProvisioningError as exc:
+        db.rollback()
+        deprovision_system_mailbox(domain.name, pfx, strict=False)
+        raise HTTPException(status_code=500, detail=f"系统邮箱底层开通失败: {exc}")
+
+    db.commit()
+    db.refresh(mb)
 
     return {
         "status": "created",

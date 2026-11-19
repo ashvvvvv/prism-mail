@@ -8,6 +8,7 @@ import time
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
 
 import test_security_and_api as fixtures
@@ -839,3 +840,234 @@ def test_magic_link_ignores_verify_keyword_in_domain_hostname():
     res = client.get("/api/agent/code?address=hostfalsepos@policytest.org")
     assert res.status_code == 200
     assert res.json()["found"] is False
+
+
+def test_init_db_preserves_conflicting_duplicate_maildir_keys_without_deletion(tmp_path):
+    legacy_db = tmp_path / "legacy_dups.sqlite3"
+    with sqlite3.connect(str(legacy_db)) as raw:
+        raw.execute(
+            """
+            CREATE TABLE mails (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                mailbox_id INTEGER,
+                folder VARCHAR(30),
+                sender VARCHAR(150),
+                recipient VARCHAR(150),
+                subject VARCHAR(255),
+                preview VARCHAR(255),
+                body_html TEXT,
+                body_text TEXT,
+                has_attachments BOOLEAN,
+                attachments_json TEXT,
+                is_read BOOLEAN,
+                is_starred BOOLEAN,
+                is_deleted BOOLEAN,
+                tags_json TEXT,
+                maildir_key VARCHAR(255),
+                maildir_path VARCHAR(500),
+                message_id VARCHAR(255),
+                created_at DATETIME
+            )
+            """
+        )
+        raw.execute(
+            "INSERT INTO mails (mailbox_id, folder, sender, recipient, subject, body_text, tags_json, maildir_key, created_at) "
+            "VALUES (1, 'inbox', 'a@example.net', 'u@example.com', 'First', 'First unique body', '[\"vip\"]', '1:legacy_dup', '2026-10-01 09:00:00')"
+        )
+        raw.execute(
+            "INSERT INTO mails (mailbox_id, folder, sender, recipient, subject, body_text, tags_json, maildir_key, created_at) "
+            "VALUES (1, 'inbox', 'b@example.net', 'u@example.com', 'Second', 'Distinct preserved body', '[\"manual\"]', '1:legacy_dup', '2026-10-02 09:00:00')"
+        )
+        raw.commit()
+
+    temp_engine = create_engine(f"sqlite:///{legacy_db}")
+    try:
+        database.run_migrations_on_engine(temp_engine)
+        with sqlite3.connect(str(legacy_db)) as conn:
+            rows = conn.execute(
+                "SELECT id, maildir_key, body_text, tags_json, received_at FROM mails ORDER BY id ASC"
+            ).fetchall()
+            assert len(rows) == 2
+            assert rows[0][1] == "1:legacy_dup"
+            assert rows[0][2] == "First unique body"
+            assert rows[1][1] == "1:legacy_dup#conflict#2"
+            assert rows[1][2] == "Distinct preserved body"
+            assert rows[1][3] == '["manual"]'
+            assert rows[0][4] is not None and rows[1][4] is not None
+
+            audit_rows = conn.execute(
+                "SELECT mail_id, mailbox_id, original_maildir_key, renamed_maildir_key FROM migration_conflict_audit"
+            ).fetchall()
+            assert audit_rows == [(2, 1, "1:legacy_dup", "1:legacy_dup#conflict#2")]
+
+            idx_rows = conn.execute("PRAGMA index_list(mails)").fetchall()
+            idx_names = {r[1]: r[2] for r in idx_rows}
+            assert idx_names.get("uq_mails_mailbox_maildir_key") == 1
+            assert "ix_mails_mb_folder_received" in idx_names
+    finally:
+        temp_engine.dispose()
+
+
+def test_provisioning_and_deprovisioning_failures_prevent_db_filesystem_drift():
+    client = _admin_client()
+    with database.SessionLocal() as db:
+        pol_dom = db.query(database.Domain).filter_by(name="policytest.org").first()
+        pol_dom_id = pol_dom.id
+
+    # 1. Provisioning write failure rolls back DB creation on both admin & agent endpoints.
+    with patch.object(main, "_atomic_write_text", side_effect=OSError("disk full")):
+        r_admin = client.post(
+            f"/api/domains/{pol_dom_id}/mailboxes",
+            json={"prefix": "provfail1", "name": "ProvFail1"},
+            headers=fixtures.CSRF_HEADERS,
+        )
+        assert r_admin.status_code == 500
+
+        r_agent = client.post(
+            "/api/agent/mailboxes",
+            json={"prefix": "provfail2", "domain": "policytest.org"},
+            headers=fixtures.CSRF_HEADERS,
+        )
+        assert r_agent.status_code == 500
+
+    with database.SessionLocal() as db:
+        assert db.query(database.Mailbox).filter_by(address="provfail1@policytest.org").first() is None
+        assert db.query(database.Mailbox).filter_by(address="provfail2@policytest.org").first() is None
+
+    # 2. Failed Maildir archival aborts delete BEFORE dropping the DB record; succeeding delete never resurrects.
+    created = client.post(
+        f"/api/domains/{pol_dom_id}/mailboxes",
+        json={"prefix": "delguard", "name": "DelGuard"},
+        headers=fixtures.CSRF_HEADERS,
+    )
+    assert created.status_code == 200
+    mb_id = created.json()["id"]
+
+    with patch.object(main.shutil, "move", side_effect=PermissionError("busy")):
+        fail_del = client.delete(f"/api/mailboxes/{mb_id}", headers=fixtures.CSRF_HEADERS)
+        assert fail_del.status_code == 500
+
+    with database.SessionLocal() as db:
+        assert db.get(database.Mailbox, mb_id) is not None
+
+    ok_del = client.delete(f"/api/mailboxes/{mb_id}", headers=fixtures.CSRF_HEADERS)
+    assert ok_del.status_code == 200
+    with database.SessionLocal() as db:
+        assert db.get(database.Mailbox, mb_id) is None
+        main.sync_maildir_to_db(db, force=True, sync_external=False)
+        assert db.query(database.Mailbox).filter_by(address="delguard@policytest.org").first() is None
+
+
+def test_imap_partial_fetch_failure_surfaces_partial_error_status():
+    client = _admin_client()
+    with database.SessionLocal() as db:
+        ext_dom = db.query(database.Domain).filter_by(name="gmail.com").first()
+        mb = database.Mailbox(
+            domain_id=ext_dom.id,
+            prefix="partialfail",
+            address="partialfail@gmail.com",
+            name="PartialFail",
+            is_external=True,
+            provider="gmail",
+            imap_host="imap.gmail.com",
+            imap_port=993,
+        )
+        mb.set_auth_password("fake-application-password")
+        db.add(mb)
+        db.commit()
+        mb_id = mb.id
+
+    class FlakyUIDIMAP:
+        fail_uid_2 = True
+        def __init__(self, *args, **kwargs): pass
+        def login(self, *args): pass
+        def _simple_command(self, *args): pass
+        def select(self, *args, **kwargs): return ("OK", [b"3"])
+        def response(self, code): return ("UIDVALIDITY", [b"901"])
+        def uid(self, action, *args):
+            if action == "search":
+                return ("OK", [b"1 2 3"])
+            if action == "fetch":
+                uid_s = str(args[0])
+                if uid_s == "2" and self.fail_uid_2:
+                    return ("NO", [b"Temporary backend timeout"])
+                raw = _build_raw_eml("src@example.net", "partialfail@gmail.com", f"Mail {uid_s}", f"Body {uid_s}")
+                return ("OK", [(b'1 (FLAGS () INTERNALDATE "19-Nov-2026 08:00:00 +0000")', raw)])
+            raise AssertionError(action)
+        def logout(self): pass
+
+    with patch.object(main, "validate_external_mail_endpoint", return_value=["127.0.0.1"]), \
+         patch.object(main, "SafeIMAP4_SSL", FlakyUIDIMAP):
+        r1 = client.post(f"/api/external-mailboxes/{mb_id}/sync", headers=fixtures.CSRF_HEADERS)
+        assert r1.status_code == 200
+        d1 = r1.json()
+        assert d1["status"] == "partial_error"
+        assert d1["new_mails"] == 2
+        assert "UID 2" in d1["sync_status"]
+        assert "detail" in d1
+
+        FlakyUIDIMAP.fail_uid_2 = False
+        r2 = client.post(f"/api/external-mailboxes/{mb_id}/sync", headers=fixtures.CSRF_HEADERS)
+        assert r2.status_code == 200
+        d2 = r2.json()
+        assert d2["status"] == "ok"
+        assert d2["new_mails"] == 1
+        assert d2["sync_status"] == "ok"
+
+
+def test_agent_allow_sync_policy_and_indexed_received_at_query():
+    client = _admin_client()
+    api_key = client.post("/api/auth/rotate-api-key", headers=fixtures.CSRF_HEADERS).json()["api_key"]
+    agent = TestClient(main.app)
+    hdrs = {"Authorization": f"Bearer {api_key}"}
+
+    with database.SessionLocal() as db:
+        ext_dom = db.query(database.Domain).filter_by(name="gmail.com").first()
+        mb = database.Mailbox(
+            domain_id=ext_dom.id,
+            prefix="syncpol",
+            address="syncpol@gmail.com",
+            name="SyncPolicy",
+            is_external=True,
+            provider="gmail",
+            imap_host="imap.gmail.com",
+            imap_port=993,
+        )
+        mb.set_auth_password("fake-application-password")
+        db.add(mb)
+        user = db.query(database.User).first()
+        original_settings = dict(user.settings or {})
+        user.settings = {
+            **original_settings,
+            "agent_policy": {"allow_send": False, "allow_sync": False, "allowed_addresses": []},
+        }
+        db.commit()
+        mb_id = mb.id
+
+    try:
+        # allow_sync=False blocks explicit /sync and skips remote IMAP triggers on Agent reads.
+        denied_sync = agent.post(f"/api/external-mailboxes/{mb_id}/sync", headers=hdrs)
+        assert denied_sync.status_code == 403
+
+        with patch.object(main, "sync_target_external_mailboxes_for_agent", side_effect=AssertionError("sync disabled")):
+            ok_read = agent.get("/api/agent/code?address=syncpol@gmail.com", headers=hdrs)
+            assert ok_read.status_code == 200
+
+        # Read-only allow_send=False with allow_sync=True can trigger targeted sync cleanly.
+        with database.SessionLocal() as db:
+            user = db.query(database.User).first()
+            user.settings = {
+                **original_settings,
+                "agent_policy": {"allow_send": False, "allow_sync": True, "allowed_addresses": ["syncpol@gmail.com"]},
+            }
+            db.commit()
+
+        with patch.object(main, "sync_single_external_mailbox", return_value=0) as mock_sync:
+            allowed_sync = agent.post(f"/api/external-mailboxes/{mb_id}/sync", headers=hdrs)
+            assert allowed_sync.status_code == 200
+            assert mock_sync.call_count == 1
+    finally:
+        with database.SessionLocal() as db:
+            user = db.query(database.User).first()
+            user.settings = original_settings
+            db.commit()
